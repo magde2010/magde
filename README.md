@@ -32,6 +32,18 @@
 
 `TELEGRAM_BOT_TOKEN`, `MEXC_API_KEY`, `MEXC_API_SECRET`, `DATABASE_URL`, `ADMIN_TELEGRAM_ID`
 
+على Railway يجب ربط خدمة البوت بخدمة PostgreSQL داخل **نفس المشروع والبيئة**، ثم ضبط
+`DATABASE_URL` كمرجع لمتغير قاعدة البيانات، مثل:
+
+```text
+${{Postgres.DATABASE_URL}}
+```
+
+إذا ظهر الخطأ `could not translate host name ... railway.internal`، فالعنوان الداخلي
+غير قابل للحل من الخدمة الحالية. صحّح مرجع `DATABASE_URL` أو أضف `DATABASE_PUBLIC_URL`
+كرابط PostgreSQL العام من خدمة قاعدة البيانات؛ التطبيق يستخدمه تلقائيًا عند اكتشاف عنوان
+داخلي غير صالح.
+
 ## ₿ BTC Risk Governor — V4
 
 بدل نظام الحماية المعقد السابق، LOTFE يستخدم BTC كمؤشر مركزي لإدارة **المخاطرة الجديدة** لكل المحافظ.

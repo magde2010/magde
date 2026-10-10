@@ -3,11 +3,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Railway may expose the database through an internal hostname. That hostname
+# is only resolvable when the app and PostgreSQL are in the same project/environment.
+def _database_url():
+    configured = (os.getenv("DATABASE_URL") or "").strip()
+    public = (os.getenv("DATABASE_PUBLIC_URL") or "").strip()
+    if ".railway.internal" in configured:
+        return public or configured
+    return configured or public
+
+
 # MEXC (مطلوب)
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 COINLOBSTER_API_KEY = os.getenv("COINLOBSTER_API_KEY", "")
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = _database_url()
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
