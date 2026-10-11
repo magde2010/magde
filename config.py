@@ -6,7 +6,6 @@ load_dotenv()
 # MEXC (مطلوب)
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
-COINLOBSTER_API_KEY = os.getenv("COINLOBSTER_API_KEY", "")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Telegram

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, List
 
-from whale_reco import fetch_recommendations, whale_status_text
 import ui_theme as ui
 
 
@@ -133,7 +132,7 @@ def build_market_report(client, db, telegram_id: int) -> str:
         }
 
     lines = [
-        ui.page_title(ui.I["market"], "تقرير حالة السوق", "ملخص شامل للسوق ومحافظك ورادار الحيتان."),
+        ui.page_title(ui.I["market"], "تقرير حالة السوق", "ملخص للسوق ومحافظك."),
         f"{snapshot['emoji']} *الحالة العامة:* {snapshot['regime']}",
         f"◎ الإجراء المقترح: *{snapshot['action']}*",
         "",
@@ -160,21 +159,6 @@ def build_market_report(client, db, telegram_id: int) -> str:
     if changes:
         lines.append("▲ *أقوى الحركة:* " + "  |  ".join(f"`{s}` {_fmt_change(v)}" for s, v in changes[:5]))
         lines.append("▼ *أضعف الحركة:* " + "  |  ".join(f"`{s}` {_fmt_change(v)}" for s, v in changes[-5:][::-1]))
-
-    try:
-        recs = fetch_recommendations(8)
-        lines.extend(["", f"{ui.I['flow']} *رادار الحيتان — قراءة فقط:*", whale_status_text(client)])
-        if recs:
-            top = sorted(recs, key=lambda item: float(item.get("score") or 0), reverse=True)[:5]
-            lines.append("أقوى الإشارات: " + " | ".join(
-                f"`{item.get('symbol', '?')}` {float(item.get('score') or 0):.0f}"
-                + (" 🔥" if item.get("can_buy") else "")
-                for item in top
-            ))
-        else:
-            lines.append("لا توجد إشارات حيتان كافية حالياً.")
-    except Exception as exc:
-        lines.extend(["", "*رادار الحيتان:* تعذر تحديثه حالياً.", f"التفاصيل: `{str(exc)[:120]}`"])
 
     lines.extend([
         "",

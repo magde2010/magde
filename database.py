@@ -33,9 +33,6 @@ class UserSettings(Base):
     be_lock_pct = Column(Float, default=4.0)    # بعد ربح X% → قفل عند الدخول
     # legacy single field kept for migration compatibility
     take_profit_pct = Column(Float, default=5.0)
-    # Persistent whale-system settings; JSON keeps the schema extensible.
-    whale_auto_settings_json = Column(Text, nullable=True)
-    smart_whale_settings_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -135,29 +132,6 @@ class PortfolioTrade(Base):
     reentry_used = Column(Boolean, default=False)
     details = Column(String(500), default="")
     created_at = Column(DateTime, default=datetime.utcnow)
-
-
-class CrashOrder(Base):
-    """Persistent tracking for crash-hunter limit buys.
-
-    Crash Hunter is account-wide in this bot, so these records intentionally do
-    not belong to a virtual portfolio. Persistence prevents a process restart
-    from forgetting live MEXC orders.
-    """
-    __tablename__ = "crash_orders"
-
-    id = Column(Integer, primary_key=True, index=True)
-    symbol = Column(String(20), nullable=False, index=True)
-    order_id = Column(String(64), unique=True, nullable=False, index=True)
-    limit_price = Column(Float, default=0.0)
-    usdt = Column(Float, default=0.0)
-    pct = Column(Float, default=0.0)
-    placed_at = Column(Float, default=0.0)
-    status = Column(String(20), default="open", index=True)
-    fill_price = Column(Float, default=0.0)
-    amount = Column(Float, default=0.0)
-    tp_order_id = Column(String(64), nullable=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class RebalanceLog(Base):
@@ -361,9 +335,6 @@ def init_db():
 
         if "user_settings" in insp.get_table_names():
             cols = [c["name"] for c in insp.get_columns("user_settings")]
-            for col in ("whale_auto_settings_json", "smart_whale_settings_json"):
-                if col not in cols:
-                    conn.execute(text(f"ALTER TABLE user_settings ADD COLUMN {col} TEXT"))
             for col, default in [
                 ("take_profit_pct", "5.0"),
                 ("stop_loss_pct", "3.0"),
@@ -803,38 +774,6 @@ def get_open_positions(db, telegram_id: int = None):
     if telegram_id:
         q = q.filter(Portfolio.telegram_id == telegram_id)
     return q.all()
-
-
-def upsert_crash_order(db, **kwargs):
-    """Persist one crash-hunter order by exchange order id."""
-    order_id = str(kwargs.get("order_id") or "")
-    if not order_id:
-        return None
-    row = db.query(CrashOrder).filter(CrashOrder.order_id == order_id).first()
-    if not row:
-        row = CrashOrder(order_id=order_id)
-        db.add(row)
-    for key, value in kwargs.items():
-        if key != "order_id" and hasattr(row, key) and value is not None:
-            setattr(row, key, value)
-    db.commit()
-    db.refresh(row)
-    return row
-
-
-def get_active_crash_orders(db):
-    return db.query(CrashOrder).filter(CrashOrder.status.in_(["open", "filled"])).all()
-
-
-def update_crash_order(db, order_id: str, **kwargs):
-    row = db.query(CrashOrder).filter(CrashOrder.order_id == str(order_id)).first()
-    if not row:
-        return None
-    for key, value in kwargs.items():
-        if hasattr(row, key) and value is not None:
-            setattr(row, key, value)
-    db.commit()
-    return row
 
 
 def log_action(db, telegram_id: int, action: str, details: str, success: bool = True, portfolio_id: int = None):
