@@ -2,7 +2,7 @@
 from __future__ import annotations
 import logging, time
 from collections import defaultdict
-from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean
+from sqlalchemy import Column, Integer, BigInteger, String, Float, Boolean, text, inspect
 import config
 from database import Base, SessionLocal
 
@@ -25,6 +25,18 @@ class OrderBookSettings(Base):
     wall_multiple = Column(Float, default=3.0, nullable=False)
     max_wall_distance_pct = Column(Float, default=0.45, nullable=False)
     scan_symbols = Column(Integer, default=12, nullable=False)
+    watch_symbols = Column(String(1000), default="", nullable=False)
+
+def ensure_order_book_schema():
+    """Add strategy-only settings to an existing database without touching portfolio tables."""
+    from database import engine
+    inspector = inspect(engine)
+    if "order_book_sniper_settings" in inspector.get_table_names():
+        columns = {c["name"] for c in inspector.get_columns("order_book_sniper_settings")}
+        if "watch_symbols" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE order_book_sniper_settings ADD COLUMN watch_symbols VARCHAR(1000) NOT NULL DEFAULT ''"))
+
 
 def get_settings(tid):
     db=SessionLocal()
@@ -63,7 +75,9 @@ class OrderBookSniper:
     def _markets(self):
         ex=self.exchange
         if time.time()-self._market_cache_at < 60 and self._ranked_cache:
-            return self._ranked_cache[:get_settings(self.tid).scan_symbols]
+            cached_settings=get_settings(self.tid)
+            watched_count=len([x for x in (cached_settings.watch_symbols or "").split(",") if x.strip()])
+            return self._ranked_cache[:max(int(cached_settings.scan_symbols),watched_count)]
         markets=ex.load_markets(); tickers=ex.fetch_tickers()
         ranked=[]
         settings=get_settings(self.tid)
@@ -72,9 +86,17 @@ class OrderBookSniper:
             t=tickers.get(sym) or {}; qv=float(t.get("quoteVolume") or 0); last=float(t.get("last") or 0)
             if last>0 and qv>=settings.min_24h_volume_usdt: ranked.append((qv,sym))
         ranked.sort(reverse=True)
-        self._ranked_cache=[s for _,s in ranked[:max(1,settings.scan_symbols)]]
+        ranked_symbols=[sym for _,sym in ranked]
+        watched=[x.strip().upper() for x in (settings.watch_symbols or "").split(",") if x.strip()]
+        # Manually selected pairs are prioritized, but still pass all spread/wall checks.
+        valid_watched=[]
+        for sym in watched:
+            if sym in markets and markets[sym].get("spot") and markets[sym].get("active") and markets[sym].get("quote")=="USDT":
+                valid_watched.append(sym)
+        limit=max(1,int(settings.scan_symbols))
+        self._ranked_cache=list(dict.fromkeys(valid_watched + ranked_symbols))[:max(limit,len(valid_watched))]
         self._market_cache_at=time.time()
-        return self._ranked_cache
+        return self._ranked_cache[:max(limit,len(valid_watched))]
     @staticmethod
     def _wall(levels, multiple):
         # A wall must materially exceed nearby levels, not just be the largest of three tiny orders.

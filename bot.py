@@ -55,7 +55,7 @@ import ui_theme as ui
 from liquidity_swings import init_liquidity_db
 from portfolio_controls import calculate_portfolio_entry_budget, calculate_safe_trim_amount, calculate_outstanding_trim_amounts
 from liquidity_swings_telegram import handle_liquidity_callback, handle_liquidity_text, liquidity_scan_job
-from order_book_sniper import get_sniper, get_settings as get_ob_settings, update_settings as update_ob_settings
+from order_book_sniper import get_sniper, get_settings as get_ob_settings, update_settings as update_ob_settings, ensure_order_book_schema
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -713,14 +713,47 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ob_wait = context.user_data.pop("ob_waiting", None)
     if ob_wait:
         try:
+            if ob_wait == "watch_symbol":
+                symbol=text.strip().upper().replace(" ","")
+                if "/" not in symbol:
+                    symbol=symbol.replace("USDT","")+"/USDT"
+                if not re.fullmatch(r"[A-Z0-9]{2,25}/USDT",symbol):
+                    raise ValueError("اكتب الزوج بالشكل ENA/USDT")
+                settings=get_ob_settings(tid)
+                items=[x.strip().upper() for x in (settings.watch_symbols or "").split(",") if x.strip()]
+                if symbol not in items: items.insert(0,symbol)
+                update_ob_settings(tid,watch_symbols=",".join(items[:20]))
+                report=f"تمت إضافة {symbol} لقائمة الفحص ذات الأولوية.\nلن يدخل البوت إلا بعد تحقق شروط السيولة والسبريد واستمرار جدار الشراء في أكثر من قراءة."
+                try:
+                    ex=getattr(get_mexc(),"exchange",get_mexc())
+                    markets=ex.load_markets()
+                    if symbol not in markets:
+                        raise ValueError("الزوج غير موجود ضمن أسواق MEXC Spot المتاحة")
+                    ob=ex.fetch_order_book(symbol,limit=20)
+                    bids=ob.get("bids") or []; asks=ob.get("asks") or []
+                    if bids and asks:
+                        bid=float(bids[0][0]); ask=float(asks[0][0]); spread=(ask-bid)/((ask+bid)/2)*100 if ask>bid else 0
+                        walls=get_sniper(tid)._wall(bids,float(get_ob_settings(tid).wall_multiple))
+                        near=[w for w in walls if 0 < (((bid+ask)/2)-w[0])/((bid+ask)/2)*100 <= float(get_ob_settings(tid).max_wall_distance_pct)]
+                        report+=f"\nأفضل طلب شراء: {bid:.8g} | أفضل عرض بيع: {ask:.8g}\nالسبريد الحالي: {spread:.4f}%\nجدران شراء قريبة: {len(near)}"
+                        if near:
+                            w=max(near,key=lambda x:x[1]); report+=f"\nأقوى جدار مرصود: {w[0]:.8g} بقيمة تقريبية ${w[1]:,.0f}"
+                        report+="\nالحالة: مراقبة فقط الآن؛ الشراء الآلي لن يحدث قبل تأكيد استمرار الجدار في دورة لاحقة."
+                except Exception as e:
+                    report+=f"\nتعذر جلب دفتر الأوامر الآن: {str(e)[:120]}"
+                await update.message.reply_text(report,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 فتح الاستراتيجية",callback_data="ob_menu"),InlineKeyboardButton("🔎 قائمة الفحص",callback_data="ob_scan")]]))
+                return
             value = float(text.strip().replace("$","").replace("%","").replace(",","."))
             if value <= 0: raise ValueError("القيمة يجب أن تكون أكبر من صفر")
-            if ob_wait == "order_usdt":
-                value=max(2.0,value)
-            update_ob_settings(tid, **{ob_wait:value})
-            await update.message.reply_text("تم حفظ الإعداد.")
+            if ob_wait == "order_usdt": value=max(2.0,value)
+            if ob_wait == "max_positions" and not 1 <= value <= 20: raise ValueError("عدد المراكز من 1 إلى 20")
+            if ob_wait == "scan_symbols" and not 1 <= value <= 100: raise ValueError("عدد الأزواج من 1 إلى 100")
+            if ob_wait in ("tp_pct","sl_pct","max_spread_pct","max_wall_distance_pct") and value > 20: raise ValueError("النسبة كبيرة جدًا؛ الحد 20%")
+            if ob_wait == "wall_multiple" and value < 1: raise ValueError("قوة الجدار يجب ألا تقل عن 1x")
+            update_ob_settings(tid, **{ob_wait:int(value) if ob_wait in ("max_positions","scan_symbols") else value})
+            await update.message.reply_text("تم حفظ الإعداد الفعلي في قاعدة البيانات.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ الإعدادات",callback_data="ob_settings"),InlineKeyboardButton("📊 الحالة",callback_data="ob_menu")]]))
         except Exception as e:
-            await update.message.reply_text(f"قيمة غير صالحة: {e}")
+            await update.message.reply_text(f"قيمة غير صالحة: {e}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("رجوع",callback_data="ob_settings")]]))
         return
 
     if await handle_liquidity_text(update, context, get_mexc):
@@ -983,19 +1016,59 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st = sniper.status()
             mode = "🟡 PAPER" if settings.mode == "PAPER" else "🔴 LIVE"
             positions = st["positions"]
-            pos_text = "\\n".join(f"• {sym}: entry {p['entry']:.8g}, value ${p['cost']:.2f}" for sym,p in positions.items()) or "لا توجد مراكز"
-            msg = (f"🧱 ORDER BOOK LIQUIDITY SNIPER\\nالحالة: {'🟢 يعمل' if st['enabled'] else '⚪ متوقف'}\\n"
-                   f"الوضع: {mode}\\nحجم الأمر: ${settings.order_usdt:g} (الحد الأدنى ${settings.min_order_usdt:g})\\n"
-                   f"المراكز: {len(positions)}/{settings.max_positions}\\nالأزواج المفحوصة: {st['scanned']}\\n"
-                   f"مدة آخر دورة: {st['scan_sec']:.2f}s\\nPnL المحقق/تقريبي: ${st['realized']:.4f}\\n"
-                   f"آخر خطأ: {st['last_error'] or 'لا يوجد'}\\n\\n{pos_text}")
+            pos_text = "\n".join(f"• {sym}: entry {p['entry']:.8g}, value ${p['cost']:.2f}" for sym,p in positions.items()) or "لا توجد مراكز"
+            msg = (f"🧱 ORDER BOOK LIQUIDITY SNIPER\nالحالة: {'🟢 يعمل' if st['enabled'] else '⚪ متوقف'}\n"
+                   f"الوضع: {mode}\nحجم الأمر: ${settings.order_usdt:g} (الحد الأدنى ${settings.min_order_usdt:g})\n"
+                   f"المراكز: {len(positions)}/{settings.max_positions}\nالأزواج المفحوصة: {st['scanned']}\n"
+                   f"مدة آخر دورة: {st['scan_sec']:.2f}s\nPnL المحقق/تقريبي: ${st['realized']:.4f}\n"
+                   f"آخر خطأ: {st['last_error'] or 'لا يوجد'}\n\n{pos_text}")
+            watched = (settings.watch_symbols or "").strip() or "اكتشاف تلقائي"
+            msg += f"\nالأزواج المفضلة: {watched}\nحجم السيولة المطلوب: ${settings.min_24h_volume_usdt:,.0f}/24h\nأقصى سبريد: {settings.max_spread_pct:g}%\nقوة جدار السيولة: {settings.wall_multiple:g}x\nعدد الأزواج بالدورة: {settings.scan_symbols}"
             kb=InlineKeyboardMarkup([
                 [InlineKeyboardButton("▶️ تشغيل",callback_data="ob_start"),InlineKeyboardButton("⏹ إيقاف",callback_data="ob_stop")],
-                [InlineKeyboardButton(f"⚡ الوضع: {settings.mode}",callback_data="ob_mode"),InlineKeyboardButton(f"💰 حجم الأمر ${settings.order_usdt:g}",callback_data="ob_size")],
+                [InlineKeyboardButton("⚙️ إعدادات التداول",callback_data="ob_settings"),InlineKeyboardButton("🔎 العملات والإشارات",callback_data="ob_scan")],
+                [InlineKeyboardButton(f"⚡ الوضع: {settings.mode}",callback_data="ob_mode"),InlineKeyboardButton(f"💵 حجم الأمر ${settings.order_usdt:g}",callback_data="ob_size")],
                 [InlineKeyboardButton(f"🎯 TP {settings.tp_pct:g}%",callback_data="ob_tp"),InlineKeyboardButton(f"🛑 SL {settings.sl_pct:g}%",callback_data="ob_sl")],
-                [InlineKeyboardButton("🔐 تأكيد السماح بـ LIVE",callback_data="ob_arm"),InlineKeyboardButton("🔄 تحديث",callback_data="ob_status")],
+                [InlineKeyboardButton("🪙 إضافة/اختيار زوج",callback_data="ob_coin"),InlineKeyboardButton("📉 إغلاق مركز",callback_data="ob_close")],
+                [InlineKeyboardButton("🔐 تأكيد LIVE",callback_data="ob_arm"),InlineKeyboardButton("🔄 تحديث",callback_data="ob_status")],
                 [InlineKeyboardButton("↩️ الرئيسية",callback_data="menu")]])
             await query.edit_message_text(msg,reply_markup=kb); return
+        if data == "ob_settings":
+            kb=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"💵 حجم الأمر ${settings.order_usdt:g}",callback_data="ob_size"),InlineKeyboardButton(f"📌 أقصى مراكز {settings.max_positions}",callback_data="ob_maxpos")],
+                [InlineKeyboardButton(f"📊 فحص أزواج {settings.scan_symbols}",callback_data="ob_scancount"),InlineKeyboardButton(f"💧 سيولة 24h ${settings.min_24h_volume_usdt:,.0f}",callback_data="ob_volume")],
+                [InlineKeyboardButton(f"↔️ أقصى سبريد {settings.max_spread_pct:g}%",callback_data="ob_spread"),InlineKeyboardButton(f"🧱 قوة الجدار {settings.wall_multiple:g}x",callback_data="ob_wall")],
+                [InlineKeyboardButton(f"📍 أقصى بعد للجدار {settings.max_wall_distance_pct:g}%",callback_data="ob_distance")],
+                [InlineKeyboardButton("↩️ رجوع",callback_data="ob_menu")]])
+            await query.edit_message_text("⚙️ إعدادات Order Book Sniper\nاضغط على الإعداد المطلوب ثم أرسل القيمة الجديدة. التعديلات محفوظة في قاعدة البيانات.",reply_markup=kb); return
+        if data == "ob_scan":
+            st=sniper.status()
+            pairs=", ".join(st.get("symbols") or []) or "لم تكتمل دورة فحص بعد"
+            await query.edit_message_text(f"🔎 نتيجة الفحص\nعدد الأزواج في آخر دورة: {st['scanned']}\nالأزواج: {pairs}\n\nإضافة زوج يدوي لا تجبر البوت على الشراء؛ الزوج يمر على شروط السبريد وجدار الشراء المستمر أولًا.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🪙 إضافة/اختيار زوج",callback_data="ob_coin")],[InlineKeyboardButton("🔄 تحديث",callback_data="ob_status"),InlineKeyboardButton("↩️ رجوع",callback_data="ob_menu")]])); return
+        if data == "ob_coin":
+            context.user_data["ob_waiting"]="watch_symbol"
+            await query.edit_message_text("أرسل زوج MEXC Spot/USDT مثل ENA/USDT أو PUMP/USDT. سيُضاف لقائمة الفحص ذات الأولوية، ولن يشتريه البوت إلا إذا تحققت شروط الإشارة.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء",callback_data="ob_menu")]])); return
+        if data == "ob_close":
+            if not sniper.positions:
+                await query.edit_message_text("لا توجد مراكز مفتوحة لإغلاقها.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("رجوع",callback_data="ob_menu")]])); return
+            rows=[[InlineKeyboardButton(f"إغلاق {sym}",callback_data=f"ob_close_{sym.replace('/','_')}")] for sym in sniper.positions]
+            rows.append([InlineKeyboardButton("إغلاق الكل",callback_data="ob_close_all")]); rows.append([InlineKeyboardButton("رجوع",callback_data="ob_menu")])
+            await query.edit_message_text("اختر المركز المراد إغلاقه:",reply_markup=InlineKeyboardMarkup(rows)); return
+        if data.startswith("ob_close_"):
+            key=data[len("ob_close_"):]
+            symbols=list(sniper.positions) if key=="all" else [key.replace("_","/")]
+            results=[]
+            for sym in symbols:
+                p=sniper.positions.get(sym)
+                if not p: continue
+                try:
+                    if not p.get("paper"):
+                        amount=float(sniper.exchange.amount_to_precision(sym,float(p["amount"])))
+                        sniper.exchange.create_order(sym,"market","sell",amount)
+                    sniper.positions.pop(sym,None); results.append(sym+" تم إغلاقه")
+                except Exception as e:
+                    results.append(sym+" فشل الإغلاق: "+str(e)[:100])
+            await query.edit_message_text("\n".join(results) or "لم يتم العثور على مركز.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("رجوع",callback_data="ob_menu")]])); return
         if data == "ob_start":
             try:
                 sniper.start(get_mexc())
@@ -1017,11 +1090,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("حوّل الوضع إلى LIVE أولًا، ثم أكد السماح.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("رجوع",callback_data="ob_menu")]])); return
             update_ob_settings(tid,live_confirmed=True)
             await query.edit_message_text("تم تأكيد LIVE. سيظل التنفيذ محدودًا بشروط الاستراتيجية وإدارة المخاطر.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 الحالة",callback_data="ob_menu")]])); return
-        if data in ("ob_size","ob_tp","ob_sl"):
-            key={"ob_size":"order_usdt","ob_tp":"tp_pct","ob_sl":"sl_pct"}[data]
+        if data in ("ob_size","ob_tp","ob_sl","ob_maxpos","ob_scancount","ob_volume","ob_spread","ob_wall","ob_distance"):
+            key={"ob_size":"order_usdt","ob_tp":"tp_pct","ob_sl":"sl_pct","ob_maxpos":"max_positions","ob_scancount":"scan_symbols","ob_volume":"min_24h_volume_usdt","ob_spread":"max_spread_pct","ob_wall":"wall_multiple","ob_distance":"max_wall_distance_pct"}[data]
             context.user_data["ob_waiting"]=key
-            label={"order_usdt":"حجم الأمر بالدولار (USDT، 2 كحد أدنى)","tp_pct":"هدف الربح بالنسبة المئوية","sl_pct":"وقف الخسارة بالنسبة المئوية"}[key]
-            await query.edit_message_text("أرسل "+label+"."); return
+            label={"order_usdt":"حجم الأمر بالدولار USDT (2 كحد أدنى)","tp_pct":"هدف الربح %","sl_pct":"وقف الخسارة %","max_positions":"أقصى عدد للمراكز (1 إلى 20)","scan_symbols":"عدد الأزواج المفحوصة (1 إلى 100)","min_24h_volume_usdt":"أقل حجم تداول 24 ساعة بالدولار","max_spread_pct":"أقصى سبريد %","wall_multiple":"قوة جدار السيولة مقارنة بالمستويات المجاورة (مثلاً 3)","max_wall_distance_pct":"أقصى مسافة عن جدار السيولة %"}[key]
+            await query.edit_message_text("أرسل "+label+".",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء",callback_data="ob_settings")]])); return
         return
     # توحيد أي زر قديم محفوظ في رسائل Telegram مع شاشة الحيتان الرئيسية.
     if data == "smart_whale_menu":
@@ -4575,6 +4648,7 @@ def main():
         raise SystemExit("DATABASE_URL مطلوب")
 
     init_db()
+    ensure_order_book_schema()
     # Strategy tables are isolated and do not modify portfolio records/models.
     init_liquidity_db()
     if config.ADMIN_TELEGRAM_ID:
