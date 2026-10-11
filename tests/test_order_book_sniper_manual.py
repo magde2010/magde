@@ -140,3 +140,21 @@ def test_closing_paper_pending_order_does_not_call_exchange_cancel(monkeypatch):
     assert ok, message
     assert "ENA/USDT" not in bot.entry_orders
     assert exchange.cancelled == []
+
+
+def test_best_sell_wall_is_tracked_after_entry(monkeypatch):
+    configure(monkeypatch, mode="PAPER")
+    exchange = FakeExchange()
+    exchange.fetch_order_book = lambda symbol, limit=30: {
+        "bids": [[100, 1], [99.99, 1], [99.98, 1], [99.97, 1], [99.96, 1]],
+        "asks": [[100.1, 1], [100.11, 1], [100.12, 100], [100.13, 1], [100.14, 1]],
+    }
+    bot = sniper_module.OrderBookSniper(123)
+    bot.exchange = exchange
+    bot.positions = {"ENA/USDT": {"entry": 100.0, "amount": 0.25, "cost": 25.0, "paper": True}}
+    bot._scan_one("ENA/USDT", sniper_module.get_settings(123))
+    status = bot.status()["wall_status"]["ENA/USDT"]
+    assert status["state"] == "position_open"
+    assert status["sell_wall_price"] == 100.12
+    assert status["sell_wall_usdt"] > 0
+    assert bot.positions["ENA/USDT"]["wall_target"] == 100.12

@@ -1030,12 +1030,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             wall_lines = []
             for sym in st["running_symbols"]:
                 ws = st.get("wall_status", {}).get(sym, {})
-                if not ws or sym in st["entry_orders"] or sym in positions: continue
+                if not ws:
+                    wall_lines.append(f"• {sym}: لم تصل قراءة دفتر الأوامر بعد")
+                    continue
                 bid, ask = ws.get("bid"), ws.get("ask")
                 market_text = (f"Bid {float(bid):.10g} / Ask {float(ask):.10g}" if bid and ask else "السعر الحالي غير متاح")
-                wp, wv = ws.get("wall_price"), ws.get("wall_usdt")
-                wall_text = f"الجدار {float(wp):.10g} (${float(wv or 0):.2f}, قوة {float(ws.get('wall_multiple') or 0):.1f}x)" if wp else "لا يوجد جدار مؤهل حاليًا"
-                wall_lines.append(f"• {sym}: {market_text} | {wall_text} | {ws.get('reason','بانتظار القراءة')} ")
+                if sym in positions:
+                    p=positions[sym]
+                    sell_price, sell_usdt = ws.get("sell_wall_price"), ws.get("sell_wall_usdt")
+                    sell_text = (f"أفضل جدار بيعي {float(sell_price):.10g} (${float(sell_usdt or 0):.2f}, قوة {float(ws.get('sell_wall_multiple') or 0):.1f}x)" if sell_price else "لا يوجد جدار بيعي مؤهل حاليًا")
+                    wall_lines.append(f"• {sym}: 🟢 مركز مفتوح | دخول {float(p.get('entry') or 0):.10g} | {market_text} | {sell_text} | {ws.get('reason','')} ")
+                elif sym in st["entry_orders"]:
+                    entry=st["entry_orders"][sym]
+                    wall_lines.append(f"• {sym}: 🟡 انتظار دخول عند {float(entry.get('price') or 0):.10g} | الجدار {float(entry.get('wall') or 0):.10g} (${float(entry.get('wall_usdt') or 0):.2f}) | {market_text} | {ws.get('reason','')} ")
+                else:
+                    wp, wv = ws.get("wall_price"), ws.get("wall_usdt")
+                    wall_text = f"جدار شراء {float(wp):.10g} (${float(wv or 0):.2f}, قوة {float(ws.get('wall_multiple') or 0):.1f}x)" if wp else "لا يوجد جدار شراء مؤهل حاليًا"
+                    wall_lines.append(f"• {sym}: 🔎 انتظار دخول | {market_text} | {wall_text} | تأكيدات {int(ws.get('confirmations') or 0)} | {ws.get('reason','بانتظار القراءة')} ")
             active_text = "\n".join(position_lines + order_lines) or "لا توجد مراكز أو أوامر دخول معلقة"
             wall_text_block = "\n".join(wall_lines) or "لا توجد حالة جدار متاحة بعد"
             budgets = st["budgets"]
@@ -1044,7 +1055,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                    f"الوضع: {mode}\nالحد الأدنى للأمر: ${settings.min_order_usdt:g}\n"
                    f"المراكز/الأوامر النشطة: {len(set(positions) | set(st['entry_orders']))}/20\n"
                    f"مدة آخر دورة: {st['scan_sec']:.2f}s\nPnL المحقق/تقريبي: ${st['realized']:.4f}\n"
-                   f"آخر خطأ: {st['last_error'] or 'لا يوجد'}\n\n*العملات المختارة والميزانيات*\n{configured}\n\n*المراكز والأوامر*\n{active_text}")
+                   f"آخر خطأ: {st['last_error'] or 'لا يوجد'}\n\n*العملات المختارة والميزانيات*\n{configured}\n\n*المتابعة الحية لكل عملة*\n{wall_text_block}\n\n*المراكز والأوامر*\n{active_text}")
             kb=InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ إضافة عملة + ميزانية",callback_data="ob_coin"),InlineKeyboardButton("📊 إدارة الصفقات",callback_data="ob_manage")],
                 [InlineKeyboardButton("▶️ تشغيل العملات المحددة",callback_data="ob_start"),InlineKeyboardButton("⏹ إيقاف الكل",callback_data="ob_stop")],
@@ -4683,6 +4694,7 @@ async def order_book_sniper_job(context: ContextTypes.DEFAULT_TYPE):
             client=get_mexc()
             sniper.exchange=getattr(client,"exchange",client)
         previous_orders = {sym: str(order.get("id")) for sym, order in sniper.entry_orders.items()}
+        previous_sell_walls = {sym: ws.get("sell_wall_price") for sym, ws in sniper.wall_status.items() if ws.get("state")=="position_open"}
         await asyncio.to_thread(sniper.scan_once)
         # Notify only when a new entry order is created, not on every 2-second poll.
         for sym, order in list(sniper.entry_orders.items()):
@@ -4704,6 +4716,26 @@ async def order_book_sniper_job(context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception:
                 logger.exception("Could not send Order Book Sniper entry notification")
+        # Notify once when a new or changed sell wall is found for an open position.
+        for sym, position in list(sniper.positions.items()):
+            ws=sniper.wall_status.get(sym,{})
+            sell_price=ws.get("sell_wall_price")
+            old_price=previous_sell_walls.get(sym)
+            if not sell_price or (old_price is not None and abs(float(old_price)-float(sell_price)) < max(abs(float(sell_price))*0.0002,1e-12)):
+                continue
+            try:
+                await context.bot.send_message(
+                    chat_id=tid,
+                    text=(
+                        f"🎯 أفضل جدار بيعي بعد الدخول | {sym}\n"
+                        f"سعر الدخول: {float(position.get('entry') or 0):.10g} USDT\n"
+                        f"الجدار البيعي: {float(sell_price):.10g} USDT\n"
+                        f"قيمة الجدار: ${float(ws.get('sell_wall_usdt') or 0):.2f} | القوة: {float(ws.get('sell_wall_multiple') or 0):.1f}x\n"
+                        f"الحالة: المركز مفتوح، والهدف يتبع هذا الجدار"
+                    ),
+                )
+            except Exception:
+                logger.exception("Could not send Order Book Sniper sell-wall notification")
     except Exception:
         logger.exception("Order Book Sniper scan failed")
 

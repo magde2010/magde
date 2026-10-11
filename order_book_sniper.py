@@ -197,7 +197,17 @@ class OrderBookSniper:
         ex=self.exchange
         if sym in self.entry_orders:
             entry=self.entry_orders[sym]
-            self.wall_status[sym]={"state":"entry_pending","bid":entry.get("bid"),"ask":entry.get("ask"),"spread_pct":entry.get("spread_pct"),"wall_price":entry.get("wall"),"wall_usdt":entry.get("wall_usdt"),"wall_multiple":entry.get("wall_multiple"),"order_price":entry.get("price"),"budget":entry.get("budget"),"paper":bool(entry.get("paper")),"updated":time.time()}
+            # Keep the displayed market price live while the entry order is resting.
+            try:
+                book=ex.fetch_order_book(sym,limit=5)
+                bids=book.get("bids") or []; asks=book.get("asks") or []
+                bid=float(bids[0][0]) if bids else entry.get("bid")
+                ask=float(asks[0][0]) if asks else entry.get("ask")
+                spread=((ask-bid)/((ask+bid)/2)*100) if bid and ask and ask>bid else entry.get("spread_pct")
+            except Exception:
+                bid,ask,spread=entry.get("bid"),entry.get("ask"),entry.get("spread_pct")
+            self.wall_status[sym]={"state":"entry_pending","bid":bid,"ask":ask,"spread_pct":spread,"wall_price":entry.get("wall"),"wall_usdt":entry.get("wall_usdt"),"wall_multiple":entry.get("wall_multiple"),"entry_wall_price":entry.get("wall"),"entry_wall_usdt":entry.get("wall_usdt"),"entry_wall_multiple":entry.get("wall_multiple"),"order_price":entry.get("price"),"budget":entry.get("budget"),"paper":bool(entry.get("paper")),"reason":"انتظار تنفيذ أمر الدخول عند الجدار المحدد","updated":time.time()}
+            self._save_runtime()
             return
         ob=ex.fetch_order_book(sym,limit=30)
         bids=ob.get("bids") or []; asks=ob.get("asks") or []
@@ -234,9 +244,15 @@ class OrderBookSniper:
         if not near_bids:
             self._save_runtime()
         p=self.positions.get(sym)
-        if p and near_asks:
-            closest=min(near_asks,key=lambda x:x[0])
-            if closest[0]>p["entry"]: p["wall_target"]=closest[0]
+        if p:
+            sell_wall=min((x for x in near_asks if x[0]>p["entry"]),key=lambda x:x[0],default=None)
+            if sell_wall:
+                p["wall_target"]=sell_wall[0]
+                self.wall_status[sym].update({"state":"position_open","entry_price":p.get("entry"),"sell_wall_price":sell_wall[0],"sell_wall_usdt":sell_wall[1],"sell_wall_multiple":sell_wall[2],"wall_target":sell_wall[0],"reason":"مركز مفتوح؛ أفضل جدار بيع قريب مرصود، والهدف عنده","updated":time.time()})
+            else:
+                p.pop("wall_target",None)
+                self.wall_status[sym].update({"state":"position_open","entry_price":p.get("entry"),"sell_wall_price":None,"sell_wall_usdt":None,"sell_wall_multiple":None,"wall_target":None,"reason":"مركز مفتوح؛ لا يوجد جدار بيع مؤهل قريب حاليًا","updated":time.time()})
+            self._save_runtime()
 
     def _buy(self,sym,bid,ask,wall,s,wall_usdt=0.0,wall_multiple=0.0,spread_pct=0.0):
         ex=self.exchange
