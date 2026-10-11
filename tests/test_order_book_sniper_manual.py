@@ -73,7 +73,9 @@ def test_only_user_selected_symbol_is_scanned_and_budget_is_used(monkeypatch):
     assert "ENA/USDT" in bot.entry_orders
     order=bot.entry_orders["ENA/USDT"]
     assert order["paper"] is True
-    assert order["budget"] == 25.0
+    assert order["budget"] == 25.0 / 3
+    assert order["dca_index"] == 1
+    assert order["dca_total"] == 3
     assert order["price"] > 0
     assert order["wall_usdt"] > 0
     assert bot.status()["wall_status"]["ENA/USDT"]["state"] == "entry_pending"
@@ -158,3 +160,17 @@ def test_best_sell_wall_is_tracked_after_entry(monkeypatch):
     assert status["sell_wall_price"] == 100.12
     assert status["sell_wall_usdt"] > 0
     assert bot.positions["ENA/USDT"]["wall_target"] == 100.12
+
+
+def test_dca_second_entry_uses_one_third_budget_and_lower_wall(monkeypatch):
+    configure(monkeypatch, mode="PAPER")
+    exchange = FakeExchange()
+    bot = sniper_module.OrderBookSniper(123)
+    bot.exchange = exchange
+    bot.positions = {"ENA/USDT": {"entry": 100.0, "amount": 0.1, "cost": 10.0, "paper": True, "dca_entries": 1}}
+    settings = sniper_module.get_settings(123)
+    bot._scan_one("ENA/USDT", settings)
+    bot._scan_one("ENA/USDT", settings)
+    order = bot.entry_orders["ENA/USDT"]
+    assert order["dca_index"] == 2
+    assert order["budget"] == 25.0 / 3

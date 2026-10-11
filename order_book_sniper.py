@@ -28,6 +28,9 @@ class OrderBookSettings(Base):
     scan_symbols = Column(Integer, default=12, nullable=False)  # legacy only
     watch_symbols = Column(String(1000), default="", nullable=False)
     symbol_budgets = Column(String(4000), default="{}", nullable=False)
+    total_budget = Column(Float, default=0.0, nullable=False)
+    dca_entries = Column(Integer, default=3, nullable=False)
+    daily_gain_limit = Column(Float, default=5.0, nullable=False)
     running_symbols = Column(String(1000), default="", nullable=False)
     runtime_state = Column(String(12000), default="{}", nullable=False)
 
@@ -41,6 +44,9 @@ def ensure_order_book_schema():
     additions = {
         "watch_symbols": "VARCHAR(1000) NOT NULL DEFAULT ''",
         "symbol_budgets": "VARCHAR(4000) NOT NULL DEFAULT '{}'",
+        "total_budget": "FLOAT NOT NULL DEFAULT 0",
+        "dca_entries": "INTEGER NOT NULL DEFAULT 3",
+        "daily_gain_limit": "FLOAT NOT NULL DEFAULT 5",
         "running_symbols": "VARCHAR(1000) NOT NULL DEFAULT ''",
         "runtime_state": "VARCHAR(12000) NOT NULL DEFAULT '{}'",
     }
@@ -81,7 +87,13 @@ def _csv(value):
 
 
 def get_symbol_budgets(tid):
-    raw=getattr(get_settings(tid), "symbol_budgets", "{}") or "{}"
+    settings=get_settings(tid)
+    total=float(getattr(settings,"total_budget",0) or 0)
+    symbols=_csv(getattr(settings,"watch_symbols","") or "")[:20]
+    if total>0 and symbols:
+        share=total/len(symbols)
+        return {sym:share for sym in symbols}
+    raw=getattr(settings, "symbol_budgets", "{}") or "{}"
     try:
         data=json.loads(raw)
         return {str(k).upper():float(v) for k,v in data.items() if float(v)>0}
@@ -240,7 +252,11 @@ class OrderBookSniper:
             self.last_wall_price[sym]=wall[0]
             self.last_wall_seen[key]+=1
             self.wall_status[sym]["confirmations"]=self.last_wall_seen[key]
-            if self.last_wall_seen[key]>=2 and sym not in self.positions and self._active_symbols_count() < min(20,max(1,int(s.max_positions))):
+            position=self.positions.get(sym)
+            dca_limit=min(3,max(1,int(getattr(s,"dca_entries",3) or 3)))
+            dca_count=int((position or {}).get("dca_entries",0) or 0)
+            lower_than_average=not position or wall[0] < float(position.get("entry") or 0)
+            if self.last_wall_seen[key]>=2 and dca_count < dca_limit and lower_than_average and self._active_symbols_count() < min(20,max(1,int(s.max_positions))):
                 self._buy(sym,bid,ask,wall[0],s,wall_usdt=wall[1],wall_multiple=wall[2],spread_pct=spread)
             elif self._active_symbols_count() >= min(20,max(1,int(s.max_positions))):
                 self.wall_status[sym].update({"state":"capacity_full","reason":"تم بلوغ الحد الأقصى للمراكز/أوامر الدخول"})
@@ -267,6 +283,17 @@ class OrderBookSniper:
             cost=float(budgets.get(sym,0))
             if cost < max(2.0,float(s.min_order_usdt)):
                 self.last_error=f"{sym}: ميزانية العملة أقل من الحد الأدنى"; return
+            dca_limit=min(3,max(1,int(getattr(s,"dca_entries",3) or 3)))
+            current=self.positions.get(sym)
+            dca_index=int((current or {}).get("dca_entries",0) or 0)+1
+            if dca_index>dca_limit: return
+            cost=cost/dca_limit
+            try:
+                daily_change=ex.fetch_ticker(sym).get("percentage")
+                if daily_change is not None and float(daily_change)>float(getattr(s,"daily_gain_limit",5.0) or 5.0):
+                    self.last_error=f"{sym}: تم تأجيل الدخول لأن الارتفاع اليومي {float(daily_change):.2f}% تجاوز الحد الآمن"; return
+            except Exception:
+                pass
             price=max(wall,bid)
             market=ex.market(sym); precision=((market.get("precision") or {}).get("price"))
             # CCXT precision can be decimal places or tick size depending on exchange mode.
@@ -283,12 +310,12 @@ class OrderBookSniper:
             if s.mode=="PAPER":
                 # Simulate a resting limit order; do not pretend it filled at submission time.
                 oid="PAPER-"+str(int(time.time()*1000))
-                self.entry_orders[sym]={"id":oid,"price":price,"amount":amount,"filled":0.0,"cost":0.0,"wall":wall,"wall_usdt":wall_usdt,"wall_multiple":wall_multiple,"bid":bid,"ask":ask,"spread_pct":spread_pct,"created":time.time(),"budget":cost,"paper":True}
+                self.entry_orders[sym]={"id":oid,"price":price,"amount":amount,"filled":0.0,"cost":0.0,"wall":wall,"wall_usdt":wall_usdt,"wall_multiple":wall_multiple,"bid":bid,"ask":ask,"spread_pct":spread_pct,"created":time.time(),"budget":cost,"dca_index":dca_index,"dca_total":dca_limit,"paper":True}
             else:
                 order=ex.create_order(sym,"limit","buy",amount,price,{"timeInForce":"GTC"})
                 oid=str(order.get("id") or "")
                 if not oid: raise RuntimeError("MEXC لم يُرجع رقمًا لأمر الدخول")
-                self.entry_orders[sym]={"id":oid,"price":price,"amount":amount,"filled":0.0,"cost":0.0,"wall":wall,"wall_usdt":wall_usdt,"wall_multiple":wall_multiple,"bid":bid,"ask":ask,"spread_pct":spread_pct,"created":time.time(),"budget":cost,"paper":False}
+                self.entry_orders[sym]={"id":oid,"price":price,"amount":amount,"filled":0.0,"cost":0.0,"wall":wall,"wall_usdt":wall_usdt,"wall_multiple":wall_multiple,"bid":bid,"ask":ask,"spread_pct":spread_pct,"created":time.time(),"budget":cost,"dca_index":dca_index,"dca_total":dca_limit,"paper":False}
             self.wall_status[sym]={"state":"entry_pending","bid":bid,"ask":ask,"spread_pct":spread_pct,"wall_price":wall,"wall_usdt":wall_usdt,"wall_multiple":wall_multiple,"confirmations":self.last_wall_seen.get((sym,"B",round(wall,12)),2),"order_price":price,"budget":cost,"paper":s.mode=="PAPER","reason":"أمر دخول محدد السعر معلق، بانتظار وصول السوق إليه" if s.mode=="PAPER" else "تم إرسال أمر شراء محدد السعر إلى MEXC","updated":time.time()}
             self._save_runtime()
         except Exception as e: self.last_error=f"{sym}: {e}"[:180]
@@ -303,7 +330,14 @@ class OrderBookSniper:
                     # A simulated buy fills only when the best ask reaches the limit price.
                     if asks and float(asks[0][0]) <= float(entry["price"]):
                         filled=float(entry["amount"]); avg=float(entry["price"])
-                        self.positions[sym]={"entry":avg,"amount":filled,"cost":avg*filled,"opened":time.time(),"paper":True,"wall":entry["wall"],"budget":entry["budget"]}
+                        existing=self.positions.get(sym)
+                        if existing:
+                            old=float(existing["amount"]); total=old+filled
+                            existing["entry"]=(float(existing["entry"])*old+avg*filled)/total
+                            existing["amount"]=total; existing["cost"]+=avg*filled; existing["dca_entries"]=entry.get("dca_index",2)
+                            existing["last_entry"]=avg
+                        else:
+                            self.positions[sym]={"entry":avg,"amount":filled,"cost":avg*filled,"opened":time.time(),"paper":True,"wall":entry["wall"],"budget":entry["budget"],"dca_entries":entry.get("dca_index",1),"last_entry":avg}
                         self.entry_orders.pop(sym,None); changed=True
                         self.wall_status[sym]={"state":"position_open","bid":None,"ask":float(asks[0][0]),"wall_price":entry.get("wall"),"wall_usdt":entry.get("wall_usdt"),"wall_multiple":entry.get("wall_multiple"),"entry_price":avg,"budget":entry["budget"],"paper":True,"reason":"تمت محاكاة تنفيذ أمر الدخول بعد وصول سعر العرض إلى الحد المحدد","updated":time.time()}
                     continue
@@ -317,7 +351,9 @@ class OrderBookSniper:
                         p["entry"]=(float(p["entry"])*old+avg*delta)/total
                         p["amount"]=total; p["cost"]+=avg*delta
                     else:
-                        self.positions[sym]={"entry":avg,"amount":delta,"cost":avg*delta,"opened":time.time(),"paper":False,"wall":entry["wall"],"budget":entry["budget"],"order_id":entry["id"]}
+                        self.positions[sym]={"entry":avg,"amount":delta,"cost":avg*delta,"opened":time.time(),"paper":False,"wall":entry["wall"],"budget":entry["budget"],"order_id":entry["id"],"dca_entries":entry.get("dca_index",1),"last_entry":avg}
+                    if p:
+                        p["dca_entries"]=entry.get("dca_index",p.get("dca_entries",1)); p["last_entry"]=avg
                     entry["filled"]=filled; entry["cost"]=filled*avg; changed=True
                 status=str(order.get("status") or "").lower()
                 if status in ("closed","canceled","cancelled","rejected","expired"):

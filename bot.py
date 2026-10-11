@@ -724,6 +724,16 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not market or not market.get("spot") or not market.get("active") or market.get("quote")!="USDT":
                     raise ValueError("الزوج غير متاح في MEXC Spot/USDT")
                 context.user_data["ob_pending_symbol"]=symbol
+                current_settings=get_ob_settings(tid)
+                if float(getattr(current_settings,"total_budget",0) or 0)>0:
+                    items=[x.strip().upper() for x in (current_settings.watch_symbols or "").split(",") if x.strip()]
+                    if symbol not in items:
+                        if len(items)>=20: raise ValueError("وصلت للحد الأقصى وهو 20 عملة مختارة")
+                        items.append(symbol); update_ob_settings(tid,watch_symbols=",".join(items))
+                    share=float(current_settings.total_budget)/len(items)
+                    context.user_data.pop("ob_pending_symbol",None)
+                    await update.message.reply_text(f"✅ تمت إضافة {symbol}.\nالميزانية العامة ${float(current_settings.total_budget):.2f} مقسمة بالتساوي.\nنصيب العملة حاليًا: ${share:.2f}، وكل عملة تدخل على 3 دفعات متساوية: ${share/3:.2f} للدفعة.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ تشغيل "+symbol,callback_data="ob_run_"+symbol.replace("/","~"))],[InlineKeyboardButton("📊 إدارة العملات والصفقات",callback_data="ob_manage"),InlineKeyboardButton("القائمة",callback_data="ob_menu")]]))
+                    return
                 context.user_data["ob_waiting"]="symbol_budget"
                 await update.message.reply_text(f"تم التحقق من {symbol} على MEXC Spot.\nأرسل الميزانية المخصصة لهذه العملة بالدولار USDT (2 دولار على الأقل).")
                 return
@@ -750,12 +760,16 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"✅ تم تحديث ميزانية {symbol} إلى ${value:.2f}.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 إدارة العملات والصفقات",callback_data="ob_manage"),InlineKeyboardButton("الحالة",callback_data="ob_menu")]]))
                 return
             value = float(text.strip().replace("$","").replace("%","").replace(",","."))
-            if value <= 0: raise ValueError("القيمة يجب أن تكون أكبر من صفر")
+            if value < 0 or (value == 0 and ob_wait != "total_budget"): raise ValueError("القيمة يجب أن تكون أكبر من صفر")
+            if ob_wait == "total_budget" and value > 0:
+                count=max(1,len([x for x in (get_ob_settings(tid).watch_symbols or "").split(",") if x.strip()]))
+                if value/count < 2: raise ValueError(f"الميزانية لا تكفي للحد الأدنى لكل عملة؛ تحتاج على الأقل ${count*2:.2f}")
             if ob_wait == "order_usdt": value=max(2.0,value)
             if ob_wait == "max_positions" and not 1 <= value <= 20: raise ValueError("عدد المراكز من 1 إلى 20")
+            if ob_wait == "dca_entries" and not 1 <= value <= 3: raise ValueError("عدد دفعات الدخول من 1 إلى 3")
             if ob_wait in ("tp_pct","sl_pct","max_spread_pct","max_wall_distance_pct") and value > 20: raise ValueError("النسبة كبيرة جدًا؛ الحد 20%")
             if ob_wait == "wall_multiple" and value < 1: raise ValueError("قوة الجدار يجب ألا تقل عن 1x")
-            update_ob_settings(tid, **{ob_wait:int(value) if ob_wait in ("max_positions","scan_symbols") else value})
+            update_ob_settings(tid, **{ob_wait:int(value) if ob_wait in ("max_positions","scan_symbols","dca_entries") else value})
             await update.message.reply_text("تم حفظ الإعداد الفعلي في قاعدة البيانات.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ الإعدادات",callback_data="ob_settings"),InlineKeyboardButton("📊 الحالة",callback_data="ob_menu")]]))
         except Exception as e:
             await update.message.reply_text(f"قيمة غير صالحة: {e}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("رجوع",callback_data="ob_settings")]]))
@@ -1026,15 +1040,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for sym,o in st["entry_orders"].items():
                 wall = float(o.get("wall") or 0); wall_usdt = float(o.get("wall_usdt") or 0)
                 kind = "محاكاة PAPER" if o.get("paper") else f"أمر MEXC #{o.get('id','?')}"
-                order_lines.append(f"• {sym}: {kind} | سعر الأمر {float(o['price']):.10g} | الجدار {wall:.10g} (${wall_usdt:.2f}) | الميزانية ${float(o['budget']):.2f}")
+                order_lines.append(f"• {sym}: {kind} | الدفعة {int(o.get('dca_index') or 1)}/{int(o.get('dca_total') or 3)} | سعر الأمر {float(o['price']):.10g} | الجدار {wall:.10g} (${wall_usdt:.2f}) | مبلغ الدفعة ${float(o['budget']):.2f}")
             active_text = "\n".join(position_lines + order_lines) or "لا توجد مراكز أو أوامر دخول معلقة"
             budgets = st["budgets"]
             configured = "\n".join(f"• {sym}: ميزانية ${budgets.get(sym, 0):.2f} | {'🟢 يعمل' if sym in st['running_symbols'] else '⚪ متوقف'}" for sym in st["symbols"]) or "لا توجد عملات مضافة"
+            dca_count=min(3,max(1,int(getattr(settings,'dca_entries',3) or 3)))
+            allocation = (f"الميزانية العامة: ${float(getattr(settings,'total_budget',0) or 0):.2f} ÷ {max(1,len(st['symbols']))} عملة | {dca_count} دفعات لكل عملة" if float(getattr(settings,'total_budget',0) or 0)>0 else f"ميزانية منفصلة لكل عملة | {dca_count} دفعات لكل عملة")
             msg = (f"🧱 ORDER BOOK LIQUIDITY SNIPER\nالحالة: {'🟢 يعمل' if st['enabled'] else '⚪ متوقف'}\n"
                    f"الوضع: {mode}\nالحد الأدنى للأمر: ${settings.min_order_usdt:g}\n"
                    f"المراكز/الأوامر النشطة: {len(set(positions) | set(st['entry_orders']))}/20\n"
                    f"مدة آخر دورة: {st['scan_sec']:.2f}s\nPnL المحقق/تقريبي: ${st['realized']:.4f}\n"
-                   f"آخر خطأ: {st['last_error'] or 'لا يوجد'}\n\n*العملات المختارة والميزانيات*\n{configured}\n\n*المراكز والأوامر*\n{active_text}\n\nاضغط زر المتابعة الحية لرؤية تفاصيل كل عملة.")
+                   f"آخر خطأ: {st['last_error'] or 'لا يوجد'}\n\n*طريقة توزيع الميزانية*\n{allocation}\n\n*العملات المختارة والميزانيات*\n{configured}\n\n*المراكز والأوامر*\n{active_text}\n\nاضغط زر المتابعة الحية لرؤية تفاصيل كل عملة.")
             kb=InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ إضافة عملة + ميزانية",callback_data="ob_coin"),InlineKeyboardButton("📊 إدارة الصفقات",callback_data="ob_manage")],
                 [InlineKeyboardButton("📡 المتابعة الحية لكل عملة",callback_data="ob_live")],
@@ -1077,6 +1093,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ كل العملات",callback_data="ob_live")],[InlineKeyboardButton("🏠 الرئيسية",callback_data="ob_menu")]]),parse_mode="Markdown"); return
         if data == "ob_settings":
             kb=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"💰 الميزانية العامة ${float(getattr(settings,'total_budget',0) or 0):g}",callback_data="ob_total_budget"),InlineKeyboardButton(f"🔢 دفعات الدخول {min(3,max(1,int(getattr(settings,'dca_entries',3) or 3)))}",callback_data="ob_dca")],
                 [InlineKeyboardButton(f"📌 أقصى عدد مراكز {min(20,settings.max_positions)} / 20",callback_data="ob_maxpos"),InlineKeyboardButton(f"↔️ فرق السعر المقبول {settings.max_spread_pct:g}%",callback_data="ob_spread")],
                 [InlineKeyboardButton(f"🧱 قوة الجدار المطلوبة {settings.wall_multiple:g} مرات",callback_data="ob_wall"),InlineKeyboardButton(f"📍 بُعد الجدار المقبول {settings.max_wall_distance_pct:g}%",callback_data="ob_distance")],
                 [InlineKeyboardButton(f"🎯 هدف الربح {settings.tp_pct:g}%",callback_data="ob_tp"),InlineKeyboardButton(f"🛑 وقف الخسارة {settings.sl_pct:g}%",callback_data="ob_sl")],
@@ -1157,10 +1174,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("حوّل الوضع إلى LIVE أولًا، ثم أكد السماح.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("رجوع",callback_data="ob_menu")]])); return
             update_ob_settings(tid,live_confirmed=True)
             await query.edit_message_text("تم تأكيد LIVE. راجع الميزانيات لكل عملة قبل التشغيل.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 الحالة",callback_data="ob_menu")]])); return
-        if data in ("ob_size","ob_tp","ob_sl","ob_maxpos","ob_spread","ob_wall","ob_distance"):
-            key={"ob_size":"order_usdt","ob_tp":"tp_pct","ob_sl":"sl_pct","ob_maxpos":"max_positions","ob_spread":"max_spread_pct","ob_wall":"wall_multiple","ob_distance":"max_wall_distance_pct"}[data]
+        if data in ("ob_size","ob_tp","ob_sl","ob_maxpos","ob_spread","ob_wall","ob_distance","ob_total_budget","ob_dca"):
+            key={"ob_size":"order_usdt","ob_tp":"tp_pct","ob_sl":"sl_pct","ob_maxpos":"max_positions","ob_spread":"max_spread_pct","ob_wall":"wall_multiple","ob_distance":"max_wall_distance_pct","ob_total_budget":"total_budget","ob_dca":"dca_entries"}[data]
             context.user_data["ob_waiting"]=key
-            label={"order_usdt":"الميزانية الافتراضية بالدولار (كل عملة لها ميزانية مستقلة، والحد الأدنى 2 USDT)","tp_pct":"هدف الربح %","sl_pct":"وقف الخسارة %","max_positions":"أقصى عدد للمراكز (1 إلى 20)","max_spread_pct":"أقصى فرق سعر مقبول % (القيمة المناسبة غالبًا 1.2)","wall_multiple":"قوة جدار السيولة مقارنة بالمستويات المجاورة (مثلاً 3 مرات)","max_wall_distance_pct":"أقصى مسافة مقبولة عن الجدار %"}[key]
+            label={"order_usdt":"الميزانية الافتراضية بالدولار","total_budget":"الميزانية العامة لكل العملات (0 لإيقاف التقسيم العام)","dca_entries":"عدد دفعات الدخول (1 إلى 3)","tp_pct":"هدف الربح %","sl_pct":"وقف الخسارة %","max_positions":"أقصى عدد للمراكز (1 إلى 20)","max_spread_pct":"أقصى فرق سعر مقبول % (القيمة المناسبة غالبًا 1.2)","wall_multiple":"قوة جدار السيولة مقارنة بالمستويات المجاورة (مثلاً 3 مرات)","max_wall_distance_pct":"أقصى مسافة مقبولة عن الجدار %"}[key]
             await query.edit_message_text("أرسل "+label+".",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء",callback_data="ob_settings")]])); return
         return
     # توحيد أي زر قديم محفوظ في رسائل Telegram مع شاشة الحيتان الرئيسية.
@@ -4721,7 +4738,7 @@ async def order_book_sniper_job(context: ContextTypes.DEFAULT_TYPE):
                         f"السعر المحدد: {float(order.get('price') or 0):.10g} USDT\n"
                         f"جدار الشراء: {float(order.get('wall') or 0):.10g} USDT\n"
                         f"قيمة الجدار: ${float(order.get('wall_usdt') or 0):.2f} | القوة: {float(order.get('wall_multiple') or 0):.1f}x\n"
-                        f"ميزانية العملة: ${float(order.get('budget') or 0):.2f}\n"
+                        f"دفعة رقم {int(order.get('dca_index') or 1)} من {int(order.get('dca_total') or 3)} | مبلغ الدفعة: ${float(order.get('budget') or 0):.2f}\n"
                         f"الحالة: {mode_label}"
                     ),
                 )
