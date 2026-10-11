@@ -714,16 +714,25 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ob_wait:
         try:
             if ob_wait == "watch_symbol":
-                symbol=text.strip().upper().replace(" ","")
-                if "/" not in symbol:
-                    symbol=symbol.replace("USDT","")+"/USDT"
-                if not re.fullmatch(r"[A-Z0-9]{2,25}/USDT",symbol):
-                    raise ValueError("اكتب الزوج بالشكل ENA/USDT")
-                ex=getattr(get_mexc(),"exchange",get_mexc())
-                markets=ex.load_markets(); market=markets.get(symbol)
-                if not market or not market.get("spot") or not market.get("active") or market.get("quote")!="USDT":
-                    raise ValueError("الزوج غير متاح في MEXC Spot/USDT")
-                context.user_data["ob_pending_symbol"]=symbol
+                raw_symbols=[x.strip().upper().replace(" ","") for x in re.split(r"[,،\n;]+",text) if x.strip()]
+                symbols=[]
+                for symbol in raw_symbols:
+                    if "/" not in symbol: symbol=symbol.replace("USDT","")+"/USDT"
+                    if not re.fullmatch(r"[A-Z0-9]{2,25}/USDT",symbol): raise ValueError(f"رمز غير صحيح: {symbol}. استخدم مثل ENA/USDT")
+                    if symbol not in symbols: symbols.append(symbol)
+                if not symbols: raise ValueError("أرسل رمزًا واحدًا على الأقل")
+                ex=getattr(get_mexc(),"exchange",get_mexc()); markets=ex.load_markets()
+                invalid=[symbol for symbol in symbols if not markets.get(symbol) or not markets[symbol].get("spot") or not markets[symbol].get("active") or markets[symbol].get("quote")!="USDT"]
+                if invalid: raise ValueError("أزواج غير متاحة على MEXC: "+", ".join(invalid))
+                current=get_ob_settings(tid); items=[x.strip().upper() for x in (current.watch_symbols or "").split(",") if x.strip()]; combined=items[:]
+                for symbol in symbols:
+                    if symbol not in combined: combined.append(symbol)
+                if len(combined)>20: raise ValueError(f"الحد الأقصى 20 عملة، والقائمة ستصبح {len(combined)}")
+                if len(symbols)>1:
+                    update_ob_settings(tid,watch_symbols=",".join(combined)); context.user_data["ob_waiting"]="total_budget_bulk"; context.user_data["ob_bulk_symbols"]=symbols
+                    await update.message.reply_text("✅ تم التحقق من المجموعة:\n"+"، ".join(symbols)+"\n\nأرسل الميزانية العامة بالدولار USDT. ستُقسم بالتساوي، وكل عملة تدخل على 3 دفعات.")
+                    return
+                symbol=symbols[0]; context.user_data["ob_pending_symbol"]=symbol
                 current_settings=get_ob_settings(tid)
                 if float(getattr(current_settings,"total_budget",0) or 0)>0:
                     items=[x.strip().upper() for x in (current_settings.watch_symbols or "").split(",") if x.strip()]
@@ -736,6 +745,14 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 context.user_data["ob_waiting"]="symbol_budget"
                 await update.message.reply_text(f"تم التحقق من {symbol} على MEXC Spot.\nأرسل الميزانية المخصصة لهذه العملة بالدولار USDT (2 دولار على الأقل).")
+                return
+            if ob_wait == "total_budget_bulk":
+                symbols=context.user_data.pop("ob_bulk_symbols",[]); value=float(text.strip().replace("$","").replace(",","."))
+                if value<=0: raise ValueError("الميزانية العامة يجب أن تكون أكبر من صفر")
+                settings=get_ob_settings(tid); count=len([x.strip() for x in (settings.watch_symbols or "").split(",") if x.strip()])
+                if value/count<2: raise ValueError(f"الميزانية لا تكفي؛ تحتاج على الأقل ${count*2:.2f} لعدد {count} عملة")
+                update_ob_settings(tid,total_budget=value); share=value/count
+                await update.message.reply_text(f"✅ تمت إضافة المجموعة بنجاح:\n{', '.join(symbols)}\n\nالميزانية العامة: ${value:.2f}\nنصيب كل عملة: ${share:.2f}\nالدفعة الواحدة: ${share/3:.2f}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 إدارة العملات",callback_data="ob_manage")],[InlineKeyboardButton("▶️ تشغيل كل العملات",callback_data="ob_start"),InlineKeyboardButton("🏠 القائمة",callback_data="ob_menu")]]))
                 return
             if ob_wait == "symbol_budget":
                 symbol=context.user_data.pop("ob_pending_symbol",None)
@@ -1105,7 +1122,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("🪙 العملات التي اخترتها:\n"+("\n".join(lines) or "لا توجد عملات مضافة")+"\n\nلا يتم فحص عملات أخرى تلقائيًا.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ إضافة عملة + ميزانية",callback_data="ob_coin")],[InlineKeyboardButton("📊 إدارة الصفقات",callback_data="ob_manage"),InlineKeyboardButton("↩️ رجوع",callback_data="ob_menu")]])); return
         if data == "ob_coin":
             context.user_data["ob_waiting"]="watch_symbol"
-            await query.edit_message_text("أرسل رمز زوج MEXC Spot/USDT مثل ENA/USDT أو PUMP/USDT. بعد التحقق هطلب منك الميزانية المخصصة للعملة.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء",callback_data="ob_menu")]])); return
+            await query.edit_message_text("أرسل مجموعة العملات في رسالة واحدة، مفصولة بفواصل أو كل عملة في سطر.\nمثال: `GM, ACN, SOL, BTC`\nأو: `GM/USDT، ACN/USDT، SOL/USDT`\nبعد التحقق سأطلب الميزانية العامة للمجموعة وأقسمها بالتساوي على 3 دفعات.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء",callback_data="ob_menu")]]),parse_mode="Markdown"); return
         if data == "ob_manage":
             st=sniper.status(); syms=sorted(set(st["positions"]) | set(st["entry_orders"]))
             rows=[]
