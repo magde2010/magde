@@ -155,6 +155,7 @@ def test_best_sell_wall_is_tracked_after_entry(monkeypatch):
     bot.exchange = exchange
     bot.positions = {"ENA/USDT": {"entry": 100.0, "amount": 0.25, "cost": 25.0, "paper": True}}
     bot._scan_one("ENA/USDT", sniper_module.get_settings(123))
+    bot._scan_one("ENA/USDT", sniper_module.get_settings(123))
     status = bot.status()["wall_status"]["ENA/USDT"]
     assert status["state"] == "position_open"
     assert status["sell_wall_price"] == 100.12

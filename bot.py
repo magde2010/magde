@@ -4749,7 +4749,7 @@ async def order_book_sniper_job(context: ContextTypes.DEFAULT_TYPE):
             ws=sniper.wall_status.get(sym,{})
             sell_price=ws.get("sell_wall_price")
             old_price=previous_sell_walls.get(sym)
-            if not sell_price or (old_price is not None and abs(float(old_price)-float(sell_price)) < max(abs(float(sell_price))*0.0002,1e-12)):
+            if not sell_price or (old_price is not None and abs(float(old_price)-float(sell_price)) < max(abs(float(sell_price))*0.005,1e-12)):
                 continue
             try:
                 await context.bot.send_message(
@@ -4759,6 +4759,7 @@ async def order_book_sniper_job(context: ContextTypes.DEFAULT_TYPE):
                         f"سعر الدخول: {float(position.get('entry') or 0):.10g} USDT\n"
                         f"الجدار البيعي: {float(sell_price):.10g} USDT\n"
                         f"قيمة الجدار: ${float(ws.get('sell_wall_usdt') or 0):.2f} | القوة: {float(ws.get('sell_wall_multiple') or 0):.1f}x\n"
+                        f"التأكيد: قراءتان متتاليتان\n"
                         f"الحالة: المركز مفتوح، والهدف يتبع هذا الجدار"
                     ),
                 )

@@ -112,6 +112,7 @@ class OrderBookSniper:
         self.tid=int(tid); self.enabled=False; self.positions={}; self.entry_orders={}; self.realized=0.0
         self.last_error=""; self.last_scan=0; self.scanned=0; self.candidates=[]
         self.exchange=None; self.last_wall_seen=defaultdict(int); self.last_wall_price={}
+        self.last_sell_wall_seen=defaultdict(int); self.last_sell_wall_price={}
         self.wall_status={}
         self._last_manage=0
         try:
@@ -267,13 +268,23 @@ class OrderBookSniper:
             self._save_runtime()
         p=self.positions.get(sym)
         if p:
-            sell_wall=min((x for x in near_asks if x[0]>p["entry"]),key=lambda x:x[0],default=None)
+            sell_wall=max((x for x in near_asks if x[0]>p["entry"]),key=lambda x:x[1],default=None)
             if sell_wall:
-                p["wall_target"]=sell_wall[0]
-                self.wall_status[sym].update({"state":"position_open","entry_price":p.get("entry"),"sell_wall_price":sell_wall[0],"sell_wall_usdt":sell_wall[1],"sell_wall_multiple":sell_wall[2],"wall_target":sell_wall[0],"reason":"مركز مفتوح؛ أفضل جدار بيع قريب مرصود، والهدف عنده","updated":time.time()})
+                previous_sell=self.last_sell_wall_price.get(sym)
+                if previous_sell is not None and abs(previous_sell-sell_wall[0]) > max(sell_wall[0]*0.0005,1e-12):
+                    self.last_sell_wall_seen[sym]=0
+                self.last_sell_wall_price[sym]=sell_wall[0]
+                self.last_sell_wall_seen[sym]+=1
+                confirmations=self.last_sell_wall_seen[sym]
+                if confirmations>=2:
+                    p["wall_target"]=sell_wall[0]
+                    self.wall_status[sym].update({"state":"position_open","entry_price":p.get("entry"),"sell_wall_price":sell_wall[0],"sell_wall_usdt":sell_wall[1],"sell_wall_multiple":sell_wall[2],"sell_wall_confirmations":confirmations,"wall_target":sell_wall[0],"reason":"مركز مفتوح؛ أقوى جدار بيع مؤكد في قراءتين","updated":time.time()})
+                else:
+                    self.wall_status[sym].update({"state":"position_open","entry_price":p.get("entry"),"sell_wall_price":None,"sell_wall_usdt":None,"sell_wall_multiple":None,"sell_wall_confirmations":confirmations,"wall_target":p.get("wall_target"),"reason":"مركز مفتوح؛ تم رصد جدار بيع واحد، بانتظار التأكيد","updated":time.time()})
             else:
+                self.last_sell_wall_seen[sym]=0; self.last_sell_wall_price.pop(sym,None)
                 p.pop("wall_target",None)
-                self.wall_status[sym].update({"state":"position_open","entry_price":p.get("entry"),"sell_wall_price":None,"sell_wall_usdt":None,"sell_wall_multiple":None,"wall_target":None,"reason":"مركز مفتوح؛ لا يوجد جدار بيع مؤهل قريب حاليًا","updated":time.time()})
+                self.wall_status[sym].update({"state":"position_open","entry_price":p.get("entry"),"sell_wall_price":None,"sell_wall_usdt":None,"sell_wall_multiple":None,"sell_wall_confirmations":0,"wall_target":None,"reason":"مركز مفتوح؛ لا يوجد جدار بيع مؤهل قريب حاليًا","updated":time.time()})
             self._save_runtime()
 
     def _buy(self,sym,bid,ask,wall,s,wall_usdt=0.0,wall_multiple=0.0,spread_pct=0.0):
