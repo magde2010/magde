@@ -48,9 +48,15 @@ DB_PATH = DATA_DIR / "trader.db"
 LOG_FILE = DATA_DIR / "trader.log"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_ADMIN_ID = str(os.getenv("TELEGRAM_ADMIN_ID", "")).strip()
+# Keep compatibility with the previous project variable name.
+TELEGRAM_ADMIN_ID = str(
+    os.getenv("TELEGRAM_ADMIN_ID") or os.getenv("ADMIN_TELEGRAM_ID") or ""
+).strip()
 MEXC_API_KEY = os.getenv("MEXC_API_KEY", "").strip()
-MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "").strip()
+# Keep compatibility with the previous project variable name.
+MEXC_SECRET_KEY = str(
+    os.getenv("MEXC_SECRET_KEY") or os.getenv("MEXC_API_SECRET") or ""
+).strip()
 
 # === Defaults (managed only from Telegram Bot after first run) ===
 DEFAULT_TRADE_AMOUNT = 10.0
@@ -1709,8 +1715,13 @@ def telegram_worker():
             time.sleep(3)
 
 def main():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_ID:
-        logger.error("TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID required")
+    missing = []
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_ADMIN_ID:
+        missing.append("TELEGRAM_ADMIN_ID (or ADMIN_TELEGRAM_ID)")
+    if missing:
+        logger.error("Required environment variables missing: %s", ", ".join(missing))
         sys.exit(1)
 
     init_db()

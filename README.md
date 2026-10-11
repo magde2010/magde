@@ -9,6 +9,10 @@ MEXC_SECRET_KEY=
 # DATABASE_URL=   (لو أضفت Postgres)
 ```
 
+يقبل البوت أيضًا الاسمين القديمين `ADMIN_TELEGRAM_ID` و`MEXC_API_SECRET` للتوافق.
+إذا ظهر خطأ عن المتغيرات الناقصة، أضف `TELEGRAM_BOT_TOKEN` و`TELEGRAM_ADMIN_ID`
+من إعدادات Variables في Railway ثم أعد النشر.
+
 ## الجديد في هذه النسخة
 - منع تكرار شراء نفس العملة لو الصفقة لسه مفتوحة
 - منع تكرار نفس الرسالة (Message ID + Hash)
