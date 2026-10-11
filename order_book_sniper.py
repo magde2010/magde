@@ -116,11 +116,28 @@ class OrderBookSniper:
         self.wall_status={}
         self._last_manage=0
         try:
+            migrated=False
             state=json.loads(getattr(get_settings(self.tid), "runtime_state", "{}") or "{}")
             self.positions=state.get("positions", {}) or {}
             self.entry_orders=state.get("entry_orders", {}) or {}
             self.realized=float(state.get("realized", 0.0) or 0.0)
             self.wall_status=state.get("wall_status", {}) or {}
+            for position in self.positions.values():
+                # A position created before DCA is treated as its first tranche.
+                if "dca_entries" not in position: position["dca_entries"]=1; migrated=True
+            for sym, order in list(self.entry_orders.items()):
+                if "dca_index" in order: continue
+                if order.get("paper"):
+                    # Cancel the old simulated full-budget order; the new logic will
+                    # recreate it using one third of the symbol allocation.
+                    self.entry_orders.pop(sym,None)
+                    self.wall_status.setdefault(sym,{})
+                    self.wall_status[sym].update({"state":"watching","reason":"تمت إعادة تهيئة أمر PAPER قديم ليعمل بنظام DCA","updated":time.time()})
+                    migrated=True
+                else:
+                    # Never alter a real exchange order that was already submitted.
+                    order["dca_index"]=1; order["dca_total"]=3; migrated=True
+            if migrated: self._save_runtime()
         except Exception:
             self.positions={}; self.entry_orders={}; self.realized=0.0; self.wall_status={}
 
