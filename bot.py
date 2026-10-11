@@ -1021,9 +1021,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             st = sniper.status()
             mode = "🟡 PAPER" if settings.mode == "PAPER" else "🔴 LIVE"
             positions = st["positions"]
-            position_lines = [f"• {sym}: دخول {p['entry']:.8g} | قيمة ${p['cost']:.2f}" for sym,p in positions.items()]
-            order_lines = [f"• {sym}: أمر شراء معلّق عند {o['price']:.8g} | ميزانية ${o['budget']:.2f}" for sym,o in st["entry_orders"].items()]
+            position_lines = [f"• {sym}: دخول {p['entry']:.8g} | كمية {p['amount']:.8g} | قيمة ${p['cost']:.2f}" for sym,p in positions.items()]
+            order_lines = []
+            for sym,o in st["entry_orders"].items():
+                wall = float(o.get("wall") or 0); wall_usdt = float(o.get("wall_usdt") or 0)
+                kind = "محاكاة PAPER" if o.get("paper") else f"أمر MEXC #{o.get('id','?')}"
+                order_lines.append(f"• {sym}: {kind} | سعر الأمر {float(o['price']):.10g} | الجدار {wall:.10g} (${wall_usdt:.2f}) | الميزانية ${float(o['budget']):.2f}")
+            wall_lines = []
+            for sym in st["running_symbols"]:
+                ws = st.get("wall_status", {}).get(sym, {})
+                if not ws or sym in st["entry_orders"] or sym in positions: continue
+                bid, ask = ws.get("bid"), ws.get("ask")
+                market_text = (f"Bid {float(bid):.10g} / Ask {float(ask):.10g}" if bid and ask else "السعر الحالي غير متاح")
+                wp, wv = ws.get("wall_price"), ws.get("wall_usdt")
+                wall_text = f"الجدار {float(wp):.10g} (${float(wv or 0):.2f}, قوة {float(ws.get('wall_multiple') or 0):.1f}x)" if wp else "لا يوجد جدار مؤهل حاليًا"
+                wall_lines.append(f"• {sym}: {market_text} | {wall_text} | {ws.get('reason','بانتظار القراءة')} ")
             active_text = "\n".join(position_lines + order_lines) or "لا توجد مراكز أو أوامر دخول معلقة"
+            wall_text_block = "\n".join(wall_lines) or "لا توجد حالة جدار متاحة بعد"
             budgets = st["budgets"]
             configured = "\n".join(f"• {sym}: ميزانية ${budgets.get(sym, 0):.2f} | {'🟢 يعمل' if sym in st['running_symbols'] else '⚪ متوقف'}" for sym in st["symbols"]) or "لا توجد عملات مضافة"
             msg = (f"🧱 ORDER BOOK LIQUIDITY SNIPER\nالحالة: {'🟢 يعمل' if st['enabled'] else '⚪ متوقف'}\n"
@@ -1074,7 +1088,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 sniper.start_symbol(sym,get_mexc())
                 sniper.scan_symbol_now(sym,get_mexc())
-                await query.edit_message_text(f"▶️ بدأ تشغيل {sym}.\nالميزانية: ${get_symbol_budgets(tid).get(sym,0):.2f}\nيفحص البوت دفتر الأوامر الآن ويحتاج ثبات الجدار في قراءتين منفصلتين قبل وضع أمر الدخول. ستستمر المتابعة تلقائيًا.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 إدارة الصفقات",callback_data="ob_manage"),InlineKeyboardButton("🔄 الحالة",callback_data="ob_status")]]))
+                ws=sniper.status().get("wall_status",{}).get(sym,{})
+                pending=sniper.status().get("entry_orders",{}).get(sym)
+                if pending:
+                    detail=f"تم إنشاء أمر دخول {'محاكي PAPER' if pending.get('paper') else 'على MEXC'} عند {float(pending['price']):.10g} USDT. الجدار: {float(pending.get('wall') or 0):.10g} بقيمة ${float(pending.get('wall_usdt') or 0):.2f}."
+                else:
+                    detail=f"السعر الحالي: Bid {float(ws.get('bid') or 0):.10g} / Ask {float(ws.get('ask') or 0):.10g}. {ws.get('reason','سيؤكد الجدار في القراءة التالية')}"
+                await query.edit_message_text(f"▶️ بدأ تشغيل {sym}.\nالميزانية: ${get_symbol_budgets(tid).get(sym,0):.2f}\n{detail}\nسيواصل البوت التحقق تلقائيًا كل دورتين ثانية.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 إدارة الصفقات",callback_data="ob_manage"),InlineKeyboardButton("🔄 الحالة",callback_data="ob_status")]]))
             except Exception as e:
                 await query.edit_message_text(f"تعذر تشغيل {sym}: {str(e)[:180]}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("رجوع",callback_data="ob_manage")]]))
             return
@@ -4662,7 +4682,28 @@ async def order_book_sniper_job(context: ContextTypes.DEFAULT_TYPE):
         if sniper.exchange is None:
             client=get_mexc()
             sniper.exchange=getattr(client,"exchange",client)
+        previous_orders = {sym: str(order.get("id")) for sym, order in sniper.entry_orders.items()}
         await asyncio.to_thread(sniper.scan_once)
+        # Notify only when a new entry order is created, not on every 2-second poll.
+        for sym, order in list(sniper.entry_orders.items()):
+            if previous_orders.get(sym) == str(order.get("id")):
+                continue
+            is_paper = bool(order.get("paper"))
+            mode_label = "محاكاة PAPER فقط، لم يُرسل أمر إلى MEXC" if is_paper else "تم إرسال أمر Limit حقيقي إلى MEXC"
+            try:
+                await context.bot.send_message(
+                    chat_id=tid,
+                    text=(
+                        f"🧱 {'أمر دخول تجريبي' if is_paper else 'تم إرسال أمر دخول'} | {sym}\n"
+                        f"السعر المحدد: {float(order.get('price') or 0):.10g} USDT\n"
+                        f"جدار الشراء: {float(order.get('wall') or 0):.10g} USDT\n"
+                        f"قيمة الجدار: ${float(order.get('wall_usdt') or 0):.2f} | القوة: {float(order.get('wall_multiple') or 0):.1f}x\n"
+                        f"ميزانية العملة: ${float(order.get('budget') or 0):.2f}\n"
+                        f"الحالة: {mode_label}"
+                    ),
+                )
+            except Exception:
+                logger.exception("Could not send Order Book Sniper entry notification")
     except Exception:
         logger.exception("Order Book Sniper scan failed")
 

@@ -70,8 +70,14 @@ def test_only_user_selected_symbol_is_scanned_and_budget_is_used(monkeypatch):
     bot.scan_symbol_now("ENA/USDT")
     assert not bot.positions
     bot.scan_symbol_now("ENA/USDT")
-    assert "ENA/USDT" in bot.positions
-    assert bot.positions["ENA/USDT"]["cost"] <= 25.01
+    assert "ENA/USDT" in bot.entry_orders
+    order=bot.entry_orders["ENA/USDT"]
+    assert order["paper"] is True
+    assert order["budget"] == 25.0
+    assert order["price"] > 0
+    assert order["wall_usdt"] > 0
+    assert bot.status()["wall_status"]["ENA/USDT"]["state"] == "entry_pending"
+    assert not bot.positions  # PAPER order is pending, not instantly filled
     assert set(exchange.book_calls) == {"ENA/USDT"}
 
 
@@ -98,3 +104,39 @@ def test_live_entry_order_is_tracked_and_manage_can_cancel_it(monkeypatch):
     assert ok, message
     assert exchange.cancelled == [("order-1", "ENA/USDT")]
     assert "ENA/USDT" not in bot.entry_orders
+
+
+def test_paper_entry_is_not_filled_until_market_reaches_limit(monkeypatch):
+    configure(monkeypatch, mode="PAPER")
+    exchange = FakeExchange()
+    bot = sniper_module.OrderBookSniper(123)
+    bot.exchange = exchange
+    bot.scan_symbol_now("ENA/USDT")
+    bot.scan_symbol_now("ENA/USDT")
+    order = bot.entry_orders["ENA/USDT"]
+    assert not bot.positions
+    # Price remains above limit, so simulated order remains pending.
+    bot._manage_entry_orders()
+    assert "ENA/USDT" in bot.entry_orders
+    # Once best ask reaches the limit, PAPER simulates a fill.
+    exchange.fetch_order_book = lambda symbol, limit=30: {
+        "bids": [[order["price"], 5]], "asks": [[order["price"], 5]]
+    }
+    bot._manage_entry_orders()
+    assert "ENA/USDT" not in bot.entry_orders
+    assert bot.positions["ENA/USDT"]["paper"] is True
+    assert bot.positions["ENA/USDT"]["entry"] == order["price"]
+
+
+def test_closing_paper_pending_order_does_not_call_exchange_cancel(monkeypatch):
+    configure(monkeypatch, mode="PAPER")
+    exchange = FakeExchange()
+    bot = sniper_module.OrderBookSniper(123)
+    bot.exchange = exchange
+    bot.scan_symbol_now("ENA/USDT")
+    bot.scan_symbol_now("ENA/USDT")
+    assert "ENA/USDT" in bot.entry_orders
+    ok, message = bot.close_symbol("ENA/USDT")
+    assert ok, message
+    assert "ENA/USDT" not in bot.entry_orders
+    assert exchange.cancelled == []

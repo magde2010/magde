@@ -94,17 +94,19 @@ class OrderBookSniper:
         self.tid=int(tid); self.enabled=False; self.positions={}; self.entry_orders={}; self.realized=0.0
         self.last_error=""; self.last_scan=0; self.scanned=0; self.candidates=[]
         self.exchange=None; self.last_wall_seen=defaultdict(int); self.last_wall_price={}
+        self.wall_status={}
         self._last_manage=0
         try:
             state=json.loads(getattr(get_settings(self.tid), "runtime_state", "{}") or "{}")
             self.positions=state.get("positions", {}) or {}
             self.entry_orders=state.get("entry_orders", {}) or {}
             self.realized=float(state.get("realized", 0.0) or 0.0)
+            self.wall_status=state.get("wall_status", {}) or {}
         except Exception:
-            self.positions={}; self.entry_orders={}; self.realized=0.0
+            self.positions={}; self.entry_orders={}; self.realized=0.0; self.wall_status={}
 
     def _save_runtime(self):
-        state={"positions":self.positions,"entry_orders":self.entry_orders,"realized":self.realized}
+        state={"positions":self.positions,"entry_orders":self.entry_orders,"realized":self.realized,"wall_status":self.wall_status}
         update_settings(self.tid, runtime_state=json.dumps(state,separators=(",",":")))
 
     def start(self, mexc_client):
@@ -150,11 +152,14 @@ class OrderBookSniper:
         symbol=symbol.upper()
         pending=self.entry_orders.get(symbol)
         if pending and self.exchange:
-            try:
-                self.exchange.cancel_order(pending["id"],symbol)
+            if pending.get("paper"):
                 self.entry_orders.pop(symbol,None); self._save_runtime()
-            except Exception as e:
-                self.last_error=f"تعذر إلغاء أمر الدخول عند إيقاف {symbol}: {str(e)[:100]}"
+            else:
+                try:
+                    self.exchange.cancel_order(pending["id"],symbol)
+                    self.entry_orders.pop(symbol,None); self._save_runtime()
+                except Exception as e:
+                    self.last_error=f"تعذر إلغاء أمر الدخول عند إيقاف {symbol}: {str(e)[:100]}"
         s=get_settings(self.tid); running=[x for x in _csv(s.running_symbols) if x!=symbol]
         update_settings(self.tid, running_symbols=",".join(running), enabled=bool(running))
         self.enabled=bool(running)
@@ -163,11 +168,14 @@ class OrderBookSniper:
         # Stop new entries and cancel this strategy's resting entry orders, but keep managing filled positions.
         for sym, pending in list(self.entry_orders.items()):
             if not self.exchange: break
-            try:
-                self.exchange.cancel_order(pending["id"],sym)
+            if pending.get("paper"):
                 self.entry_orders.pop(sym,None); self._save_runtime()
-            except Exception as e:
-                self.last_error=f"تعذر إلغاء أمر الدخول {sym} عند إيقاف الكل: {str(e)[:100]}"
+            else:
+                try:
+                    self.exchange.cancel_order(pending["id"],sym)
+                    self.entry_orders.pop(sym,None); self._save_runtime()
+                except Exception as e:
+                    self.last_error=f"تعذر إلغاء أمر الدخول {sym} عند إيقاف الكل: {str(e)[:100]}"
         update_settings(self.tid, enabled=False, running_symbols="")
         self.enabled=False
 
@@ -188,37 +196,49 @@ class OrderBookSniper:
     def _scan_one(self,sym,s):
         ex=self.exchange
         if sym in self.entry_orders:
+            entry=self.entry_orders[sym]
+            self.wall_status[sym]={"state":"entry_pending","bid":entry.get("bid"),"ask":entry.get("ask"),"spread_pct":entry.get("spread_pct"),"wall_price":entry.get("wall"),"wall_usdt":entry.get("wall_usdt"),"wall_multiple":entry.get("wall_multiple"),"order_price":entry.get("price"),"budget":entry.get("budget"),"paper":bool(entry.get("paper")),"updated":time.time()}
             return
         ob=ex.fetch_order_book(sym,limit=30)
         bids=ob.get("bids") or []; asks=ob.get("asks") or []
-        if not bids or not asks:return
+        if not bids or not asks:
+            self.wall_status[sym]={"state":"no_book","reason":"دفتر الأوامر فارغ","updated":time.time()}; self._save_runtime(); return
         bid,ask=float(bids[0][0]),float(asks[0][0])
-        if bid<=0 or ask<=bid:return
+        if bid<=0 or ask<=bid:
+            self.wall_status[sym]={"state":"bad_book","bid":bid,"ask":ask,"reason":"أسعار دفتر الأوامر غير صالحة","updated":time.time()}; self._save_runtime(); return
         spread=(ask-bid)/((ask+bid)/2)*100
-        if spread>s.max_spread_pct:return
+        if spread>s.max_spread_pct:
+            self.wall_status[sym]={"state":"spread_rejected","bid":bid,"ask":ask,"spread_pct":spread,"reason":f"السبريد {spread:.4f}% أكبر من الحد {s.max_spread_pct:g}%","updated":time.time()}; self._save_runtime(); return
         bw=self._wall(bids,s.wall_multiple); aw=self._wall(asks,s.wall_multiple)
         mid=(bid+ask)/2
         near_bids=[x for x in bw if 0 < (mid-x[0])/mid*100 <= s.max_wall_distance_pct]
         near_asks=[x for x in aw if 0 < (x[0]-mid)/mid*100 <= s.max_wall_distance_pct]
+        self.wall_status[sym]={"state":"watching","bid":bid,"ask":ask,"spread_pct":spread,"wall_price":None,"wall_usdt":None,"wall_multiple":None,"confirmations":0,"reason":"لم يتم العثور على جدار شراء قريب مستوفٍ للشروط","updated":time.time()}
         if near_bids:
             wall=max(near_bids,key=lambda x:x[1]); key=(sym,"B",round(wall[0],12))
+            self.wall_status[sym].update({"wall_price":wall[0],"wall_usdt":wall[1],"wall_multiple":wall[2],"reason":"تم رصد جدار شراء، بانتظار تأكيد ظهوره في قراءة ثانية"})
             # A changed wall price resets persistence. Two separate snapshots are required.
             previous=self.last_wall_price.get(sym)
             if previous is not None and abs(previous-wall[0]) > max(wall[0]*0.0002, 1e-12):
                 self.last_wall_seen[key]=0
             self.last_wall_price[sym]=wall[0]
             self.last_wall_seen[key]+=1
+            self.wall_status[sym]["confirmations"]=self.last_wall_seen[key]
             if self.last_wall_seen[key]>=2 and sym not in self.positions and self._active_symbols_count() < min(20,max(1,int(s.max_positions))):
-                self._buy(sym,bid,ask,wall[0],s)
+                self._buy(sym,bid,ask,wall[0],s,wall_usdt=wall[1],wall_multiple=wall[2],spread_pct=spread)
+            elif self._active_symbols_count() >= min(20,max(1,int(s.max_positions))):
+                self.wall_status[sym].update({"state":"capacity_full","reason":"تم بلوغ الحد الأقصى للمراكز/أوامر الدخول"})
         else:
             for old_key in [k for k in self.last_wall_seen if k[0]==sym]:
                 self.last_wall_seen[old_key]=0
+        if not near_bids:
+            self._save_runtime()
         p=self.positions.get(sym)
         if p and near_asks:
             closest=min(near_asks,key=lambda x:x[0])
             if closest[0]>p["entry"]: p["wall_target"]=closest[0]
 
-    def _buy(self,sym,bid,ask,wall,s):
+    def _buy(self,sym,bid,ask,wall,s,wall_usdt=0.0,wall_multiple=0.0,spread_pct=0.0):
         ex=self.exchange
         try:
             budgets=get_symbol_budgets(self.tid)
@@ -239,13 +259,15 @@ class OrderBookSniper:
             if amount<=0 or amount*price+1e-9<max(2.0,float(s.min_order_usdt)):
                 self.last_error=f"{sym}: الكمية بعد التقريب أقل من الحد الأدنى"; return
             if s.mode=="PAPER":
-                self.positions[sym]={"entry":price,"amount":amount,"cost":price*amount,"opened":time.time(),"paper":True,"wall":wall,"budget":cost}
-                self._save_runtime()
-                return
-            order=ex.create_order(sym,"limit","buy",amount,price,{"timeInForce":"GTC"})
-            oid=str(order.get("id") or "")
-            if not oid: raise RuntimeError("MEXC لم يُرجع رقمًا لأمر الدخول")
-            self.entry_orders[sym]={"id":oid,"price":price,"amount":amount,"filled":0.0,"cost":0.0,"wall":wall,"created":time.time(),"budget":cost}
+                # Simulate a resting limit order; do not pretend it filled at submission time.
+                oid="PAPER-"+str(int(time.time()*1000))
+                self.entry_orders[sym]={"id":oid,"price":price,"amount":amount,"filled":0.0,"cost":0.0,"wall":wall,"wall_usdt":wall_usdt,"wall_multiple":wall_multiple,"bid":bid,"ask":ask,"spread_pct":spread_pct,"created":time.time(),"budget":cost,"paper":True}
+            else:
+                order=ex.create_order(sym,"limit","buy",amount,price,{"timeInForce":"GTC"})
+                oid=str(order.get("id") or "")
+                if not oid: raise RuntimeError("MEXC لم يُرجع رقمًا لأمر الدخول")
+                self.entry_orders[sym]={"id":oid,"price":price,"amount":amount,"filled":0.0,"cost":0.0,"wall":wall,"wall_usdt":wall_usdt,"wall_multiple":wall_multiple,"bid":bid,"ask":ask,"spread_pct":spread_pct,"created":time.time(),"budget":cost,"paper":False}
+            self.wall_status[sym]={"state":"entry_pending","bid":bid,"ask":ask,"spread_pct":spread_pct,"wall_price":wall,"wall_usdt":wall_usdt,"wall_multiple":wall_multiple,"confirmations":self.last_wall_seen.get((sym,"B",round(wall,12)),2),"order_price":price,"budget":cost,"paper":s.mode=="PAPER","reason":"أمر دخول محدد السعر معلق، بانتظار وصول السوق إليه" if s.mode=="PAPER" else "تم إرسال أمر شراء محدد السعر إلى MEXC","updated":time.time()}
             self._save_runtime()
         except Exception as e: self.last_error=f"{sym}: {e}"[:180]
 
@@ -253,6 +275,16 @@ class OrderBookSniper:
         changed=False
         for sym,entry in list(self.entry_orders.items()):
             try:
+                if entry.get("paper"):
+                    book=self.exchange.fetch_order_book(sym,limit=5)
+                    asks=book.get("asks") or []
+                    # A simulated buy fills only when the best ask reaches the limit price.
+                    if asks and float(asks[0][0]) <= float(entry["price"]):
+                        filled=float(entry["amount"]); avg=float(entry["price"])
+                        self.positions[sym]={"entry":avg,"amount":filled,"cost":avg*filled,"opened":time.time(),"paper":True,"wall":entry["wall"],"budget":entry["budget"]}
+                        self.entry_orders.pop(sym,None); changed=True
+                        self.wall_status[sym]={"state":"position_open","bid":None,"ask":float(asks[0][0]),"wall_price":entry.get("wall"),"wall_usdt":entry.get("wall_usdt"),"wall_multiple":entry.get("wall_multiple"),"entry_price":avg,"budget":entry["budget"],"paper":True,"reason":"تمت محاكاة تنفيذ أمر الدخول بعد وصول سعر العرض إلى الحد المحدد","updated":time.time()}
+                    continue
                 order=self.exchange.fetch_order(entry["id"],sym)
                 filled=float(order.get("filled") or 0); avg=float(order.get("average") or entry["price"])
                 delta=max(0.0,filled-float(entry.get("filled") or 0))
@@ -364,19 +396,22 @@ class OrderBookSniper:
             self._manage_entry_orders()
         pending=self.entry_orders.get(sym)
         if pending and self.exchange:
-            try:
-                self.exchange.cancel_order(pending["id"],sym)
-                self.entry_orders.pop(sym,None); messages.append("تم إلغاء أمر الدخول المعلق"); self._save_runtime()
-            except Exception as e:
-                # Do not market sell until the pending buy has been canceled/verified.
+            if pending.get("paper"):
+                self.entry_orders.pop(sym,None); messages.append("تم إلغاء أمر الدخول المحاكي"); self._save_runtime()
+            else:
                 try:
-                    chk=self.exchange.fetch_order(pending["id"],sym)
-                    if str(chk.get("status") or "").lower() in ("canceled","cancelled","closed","rejected","expired"):
-                        self.entry_orders.pop(sym,None); self._save_runtime()
-                    else:
-                        return False, f"تعذر إلغاء أمر الدخول، لم يتم البيع لتجنب شراء جديد أثناء الإغلاق: {str(e)[:100]}"
-                except Exception:
-                    return False, f"تعذر التحقق من إلغاء أمر الدخول، لم يتم البيع: {str(e)[:100]}"
+                    self.exchange.cancel_order(pending["id"],sym)
+                    self.entry_orders.pop(sym,None); messages.append("تم إلغاء أمر الدخول المعلق"); self._save_runtime()
+                except Exception as e:
+                    # Do not market sell until the pending buy has been canceled/verified.
+                    try:
+                        chk=self.exchange.fetch_order(pending["id"],sym)
+                        if str(chk.get("status") or "").lower() in ("canceled","cancelled","closed","rejected","expired"):
+                            self.entry_orders.pop(sym,None); self._save_runtime()
+                        else:
+                            return False, f"تعذر إلغاء أمر الدخول، لم يتم البيع لتجنب شراء جديد أثناء الإغلاق: {str(e)[:100]}"
+                    except Exception:
+                        return False, f"تعذر التحقق من إلغاء أمر الدخول، لم يتم البيع: {str(e)[:100]}"
         p=self.positions.get(sym)
         if p:
             try:
@@ -404,7 +439,7 @@ class OrderBookSniper:
     def status(self):
         s=get_settings(self.tid)
         return {"enabled":bool(s.enabled),"mode":s.mode,"positions":self.positions,"entry_orders":self.entry_orders,
-                "scanned":self.scanned,"scan_sec":self.last_scan,"realized":self.realized,"last_error":self.last_error,
+                "wall_status":self.wall_status,"scanned":self.scanned,"scan_sec":self.last_scan,"realized":self.realized,"last_error":self.last_error,
                 "symbols":_csv(s.watch_symbols),"running_symbols":_csv(s.running_symbols),"budgets":get_symbol_budgets(self.tid)}
 
 _instances={}
