@@ -12,7 +12,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, date, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -32,7 +34,16 @@ _SESSION_FACTORY = None
 # fetching the same four OHLCV histories on every 60-second scan while still
 # refreshing immediately after a new candle can become closed.
 _OHLCV_CACHE: Dict[Tuple[int, str, str, int], Tuple[float, Any, List[list]]] = {}
+_OHLCV_CACHE_LOCK = threading.Lock()
 _TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
+_DB_READY_ENGINE = None
+
+SCAN_ENGINE_VERSION = 2
+DEFAULT_SCAN_BATCH = 60
+MAX_SCAN_BATCH = 200
+# Concurrent public OHLCV requests. MEXC allows far more; this stays well within
+# its market-data limits while cutting a cycle from minutes to seconds.
+SCAN_WORKERS = 8
 
 
 def _utcnow():
@@ -69,7 +80,8 @@ class LiquiditySettings(LiquidityBase):
     auto_discover = Column(Boolean, nullable=False, default=True)
     excluded_symbols_json = Column(Text, nullable=False, default="[]")
     # Maximum symbols processed per cycle, not a cap on the discovered universe.
-    max_symbols = Column(Integer, nullable=False, default=10)
+    max_symbols = Column(Integer, nullable=False, default=60)
+    scan_engine_version = Column(Integer, nullable=False, default=2)
     market_symbols_count = Column(Integer, nullable=False, default=0)
     discovery_cursor = Column(Integer, nullable=False, default=0)
     allocated_capital = Column(Float, nullable=False, default=100.0)
@@ -188,7 +200,12 @@ class LiquiditySymbolScan(LiquidityBase):
 
 
 def init_liquidity_db() -> None:
+    global _DB_READY_ENGINE
     engine = _db_engine()
+    # Schema checks cost several round-trips to Postgres; run them once per engine
+    # instead of three times on every 60-second scan cycle.
+    if _DB_READY_ENGINE is engine:
+        return
     LiquidityBase.metadata.create_all(bind=engine)
     # create_all does not add columns to an existing table; migrate this isolated strategy table.
     from sqlalchemy import inspect, text
@@ -214,6 +231,17 @@ def init_liquidity_db() -> None:
                 })
                 # These were the old built-in defaults, not user selections. Do not
                 # pin BTC/ETH/SOL forever when the user asked for market discovery.
+            if "scan_engine_version" not in cols:
+                conn.execute(text("ALTER TABLE liquidity_strategy_settings ADD COLUMN scan_engine_version INTEGER NOT NULL DEFAULT 0"))
+            # The staged parallel scanner makes large batches cheap. Lift the old
+            # default batch of 10 once so the whole market is covered quickly.
+            conn.execute(text(
+                "UPDATE liquidity_strategy_settings SET max_symbols = :batch WHERE max_symbols = 10 AND scan_engine_version < :version"
+            ), {"batch": DEFAULT_SCAN_BATCH, "version": SCAN_ENGINE_VERSION})
+            conn.execute(text(
+                "UPDATE liquidity_strategy_settings SET scan_engine_version = :version WHERE scan_engine_version < :version"
+            ), {"version": SCAN_ENGINE_VERSION})
+    _DB_READY_ENGINE = engine
 
 
 def _now() -> datetime:
@@ -286,7 +314,8 @@ def _closed_ohlcv(exchange, pair: str, timeframe: str, limit: int = 120) -> List
     """Fetch candle history with timeframe-aware caching, returning closed candles only."""
     now = time.time()
     key = (id(exchange), str(pair), str(timeframe), int(limit))
-    cached = _OHLCV_CACHE.get(key)
+    with _OHLCV_CACHE_LOCK:
+        cached = _OHLCV_CACHE.get(key)
     if cached and cached[1] is exchange and cached[0] > now:
         rows = cached[2]
     else:
@@ -295,13 +324,14 @@ def _closed_ohlcv(exchange, pair: str, timeframe: str, limit: int = 120) -> List
         # request failed, do not cache the failure: the next cycle may retry.
         frame_seconds = _TF_SECONDS.get(str(timeframe), 300)
         next_boundary = (int(now // frame_seconds) + 1) * frame_seconds
-        _OHLCV_CACHE[key] = (next_boundary + 2.0, exchange, [list(row) for row in rows])
-        if len(_OHLCV_CACHE) > 5000:
-            for old_key, (expires, _exchange_ref, _rows) in list(_OHLCV_CACHE.items()):
-                if expires <= now:
-                    _OHLCV_CACHE.pop(old_key, None)
-            while len(_OHLCV_CACHE) > 5000:
-                _OHLCV_CACHE.pop(next(iter(_OHLCV_CACHE)))
+        with _OHLCV_CACHE_LOCK:
+            _OHLCV_CACHE[key] = (next_boundary + 2.0, exchange, [list(row) for row in rows])
+            if len(_OHLCV_CACHE) > 5000:
+                for old_key, (expires, _exchange_ref, _rows) in list(_OHLCV_CACHE.items()):
+                    if expires <= now:
+                        _OHLCV_CACHE.pop(old_key, None)
+                while len(_OHLCV_CACHE) > 5000:
+                    _OHLCV_CACHE.pop(next(iter(_OHLCV_CACHE)))
     if not rows:
         return []
     # The final CCXT candle is normally still forming; never trade from it.
@@ -340,9 +370,25 @@ def diagnose_long_setup(
     stop_buffer_pct: float = 0.2,
     entry_profile: str = "balanced",
 ) -> Tuple[Optional[Dict[str, float]], str, str]:
-    """Return the candidate and a human-readable, stage-specific scan diagnosis."""
-    if min(len(candles_4h), len(candles_1h), len(candles_15m), len(candles_5m)) < 25:
-        return None, "insufficient_data", "بيانات الشموع غير كافية على إطار زمني واحد أو أكثر"
+    """Return the candidate and a human-readable, stage-specific scan diagnosis.
+
+    Each timeframe may be a candle list or a zero-argument callable. Callables are
+    resolved only when the previous stage passes, so a symbol rejected on 4H never
+    costs 1H/15m/5m exchange requests.
+    """
+    insufficient = (None, "insufficient_data", "بيانات الشموع غير كافية على إطار زمني واحد أو أكثر")
+    inputs = (candles_4h, candles_1h, candles_15m, candles_5m)
+    materialized = [c for c in inputs if not callable(c)]
+    if len(materialized) == len(inputs) and min(len(c) for c in materialized) < 25:
+        return insufficient
+
+    def _resolve(candles):
+        rows = candles() if callable(candles) else candles
+        return rows or []
+
+    candles_4h = _resolve(candles_4h)
+    if len(candles_4h) < 25:
+        return insufficient
     close4 = [_safe_float(c[4]) for c in candles_4h]
     if len(close4) < 50:
         return None, "insufficient_data", "نحتاج 50 شمعة مغلقة على إطار 4H لحساب الاتجاه"
@@ -359,10 +405,16 @@ def diagnose_long_setup(
     if not trend_ok:
         return None, "trend_not_bullish", f"شرط اتجاه 4H غير متحقق (المستوى: {profile})"
 
+    candles_1h = _resolve(candles_1h)
+    if len(candles_1h) < 25:
+        return insufficient
     highs1, lows1 = confirmed_pivots(candles_1h, pivot_length)
     if not lows1:
         return None, "no_liquidity_low", "لم يتم تأكيد قاع سيولة على 1H حتى الآن"
     zone_index, zone_low = lows1[-1]
+    candles_15m = _resolve(candles_15m)
+    if len(candles_15m) < 25:
+        return insufficient
     # A sweep is a 15m event; its 5m confirmation often arrives in the next
     # candle(s). Keep the last four CLOSED 15m candles in the search window.
     fifteen_minutes_ms = 15 * 60 * 1000
@@ -381,6 +433,9 @@ def diagnose_long_setup(
             f"آخر قاع سيولة {zone_low:.8g}"
         )
 
+    candles_5m = _resolve(candles_5m)
+    if len(candles_5m) < 25:
+        return insufficient
     selected = None
     newest_sweep_without_confirmation = recent_sweeps[0]
     for sweep_idx, sweep_candle, candidate_sweep_low, sweep_ts in recent_sweeps:
@@ -778,7 +833,7 @@ def _entry_live(client, db, settings: LiquiditySettings, symbol: str, signal: Di
         if not order.get("id"):
             pos.status = "entry_submitting"
             pos.last_error = "رد شراء بلا رقم أمر؛ نتيجة التنفيذ غير مؤكدة"
-            return pos, "⚠️ رد MEXC بلا رقم أمر شراء؛ لن أعيد المحاولة تلقائيًا، راجع سجل المنصة."
+            return pos, "⚠️ رد MEXC بلا رقم أمر شراء؛ لن أعيد المحاولة تلقائيًا، راج�� سجل المنصة."
         pos.pending_order_id = str(order["id"])
         pos.pending_side = "buy"
         pos.status = "pending_entry"
@@ -983,6 +1038,37 @@ def monitoring_status(telegram_id: int) -> Dict[str, Any]:
         }
 
 
+def _scan_symbol(client, symbol: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Fetch only the timeframes a symbol needs and diagnose it. Runs in a worker thread."""
+    pair = _pair(client, symbol)
+    fetched: Dict[str, List[list]] = {}
+
+    def _loader(timeframe: str):
+        def load() -> List[list]:
+            fetched[timeframe] = _closed_ohlcv(client.exchange, pair, timeframe, 120)
+            return fetched[timeframe]
+        return load
+
+    try:
+        signal, state, detail = diagnose_long_setup(
+            _loader("4h"), _loader("1h"), _loader("15m"), _loader("5m"),
+            pivot_length=params["pivot_length"], min_rr=params["min_rr"],
+            stop_buffer_pct=params["stop_buffer_pct"], entry_profile=params["entry_profile"],
+        )
+    except Exception as exc:
+        return {"error": exc, "candles": fetched}
+    return {"signal": signal, "state": state, "detail": detail, "candles": fetched}
+
+
+def _scan_symbols_parallel(client, symbols: Sequence[str], params: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    if not symbols:
+        return {}
+    workers = max(1, min(SCAN_WORKERS, len(symbols)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="liq-scan") as pool:
+        futures = {symbol: pool.submit(_scan_symbol, client, symbol, params) for symbol in symbols}
+        return {symbol: future.result() for symbol, future in futures.items()}
+
+
 def _scan_once_impl(client, telegram_id: int, monitor: Dict[str, Any]) -> List[Dict[str, str]]:
     """One scan cycle. Manages strategy positions, then optionally seeks new entries."""
     events: List[Dict[str, str]] = []
@@ -1084,27 +1170,39 @@ def _scan_once_impl(client, telegram_id: int, monitor: Dict[str, Any]) -> List[D
         except (ValueError, TypeError, json.JSONDecodeError):
             last_signals = {}
 
+        scan_params = {
+            "pivot_length": int(settings.pivot_length),
+            "min_rr": float(settings.min_rr),
+            "stop_buffer_pct": float(settings.stop_buffer_pct),
+            "entry_profile": str(settings.entry_profile or "balanced"),
+        }
+        to_scan: List[str] = []
         for base in symbols:
-            if len(current_positions) >= int(settings.max_open_positions):
-                monitor["cycle_state"] = "blocked"
-                monitor["cycle_reason"] = "تم بلوغ الحد الأقصى للصفقات أثناء الدورة؛ لم يتم فحص باقي العملات"
-                break
             symbol = str(base).upper().strip()
-            if not symbol:
+            if not symbol or symbol in to_scan:
                 continue
             if any(p.symbol == symbol and p.status != "closed" for p in current_positions):
                 _upsert_symbol_scan(db, telegram_id, symbol, "position_open",
                                     "توجد صفقة مفتوحة لهذه العملة؛ تتم إدارتها بدل فتح صفقة أخرى",
                                     checked=False)
                 continue
+            to_scan.append(symbol)
+        scan_results = _scan_symbols_parallel(client, to_scan, scan_params)
+
+        for symbol in to_scan:
+            if len(current_positions) >= int(settings.max_open_positions):
+                monitor["cycle_state"] = "blocked"
+                monitor["cycle_reason"] = "تم بلوغ الحد الأقصى للصفقات أثناء الدورة؛ لم يتم فحص باقي العملات"
+                break
             pair = _pair(client, symbol)
-            candles_4h = candles_1h = candles_15m = candles_5m = []
-            try:
-                candles_4h = _closed_ohlcv(client.exchange, pair, "4h", 120)
-                candles_1h = _closed_ohlcv(client.exchange, pair, "1h", 120)
-                candles_15m = _closed_ohlcv(client.exchange, pair, "15m", 120)
-                candles_5m = _closed_ohlcv(client.exchange, pair, "5m", 120)
-            except Exception as exc:
+            result = scan_results.get(symbol) or {"error": "لم يكتمل الفحص", "candles": {}}
+            fetched = result.get("candles") or {}
+            candles_4h = fetched.get("4h") or []
+            candles_1h = fetched.get("1h") or []
+            candles_15m = fetched.get("15m") or []
+            candles_5m = fetched.get("5m") or []
+            if result.get("error"):
+                exc = result["error"]
                 monitor["errors_count"] += 1
                 monitor["last_error"] = f"{symbol}: {str(exc)[:240]}"
                 _upsert_symbol_scan(db, telegram_id, symbol, "error",
@@ -1112,17 +1210,13 @@ def _scan_once_impl(client, telegram_id: int, monitor: Dict[str, Any]) -> List[D
                 logger.warning("Liquidity scan failed for %s: %s", symbol, exc)
                 continue
             monitor["symbols_checked"] += 1
+            signal = result.get("signal")
+            diagnosis_state = result.get("state") or "error"
+            diagnosis = result.get("detail") or ""
             last5_price = _safe_float(candles_5m[-1][4]) if candles_5m else 0.0
-            signal, diagnosis_state, diagnosis = diagnose_long_setup(
-                candles_4h, candles_1h, candles_15m, candles_5m,
-                pivot_length=settings.pivot_length, min_rr=settings.min_rr,
-                stop_buffer_pct=settings.stop_buffer_pct,
-                entry_profile=settings.entry_profile,
-            )
             _upsert_symbol_scan(
                 db, telegram_id, symbol, diagnosis_state, diagnosis,
-                price=last5_price, candles={"4h": candles_4h, "1h": candles_1h,
-                                             "15m": candles_15m, "5m": candles_5m},
+                price=last5_price if candles_5m else None, candles=fetched,
                 signal_found=bool(signal),
             )
             if not signal:
