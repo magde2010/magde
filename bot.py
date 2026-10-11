@@ -739,7 +739,7 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     items.append(symbol)
                 update_ob_settings(tid,watch_symbols=",".join(items))
                 set_symbol_budget(tid,symbol,value)
-                await update.message.reply_text(f"✅ تمت إضافة {symbol} بميزانية ${value:.2f}.\nاضغط تشغيل لبدء تحليل دفتر الأوامر لهذا الزوج فقط. لن يشتري قبل تحقق شروط الجدار والسيولة والسبريد.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ تشغيل "+symbol,callback_data="ob_run_"+symbol.replace("/","~"))],[InlineKeyboardButton("📊 إدارة العملات والصفقات",callback_data="ob_manage"),InlineKeyboardButton("القائمة",callback_data="ob_menu")]]))
+                await update.message.reply_text(f"✅ تمت إضافة {symbol} بميزانية ${value:.2f}.\nاضغط تشغيل لبدء تحليل دفتر الأوامر لهذا الزوج فقط. لن يشتري قبل تحقق شروط الجدار والسيولة وفرق السعر المقبول.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ تشغيل "+symbol,callback_data="ob_run_"+symbol.replace("/","~"))],[InlineKeyboardButton("📊 إدارة العملات والصفقات",callback_data="ob_manage"),InlineKeyboardButton("القائمة",callback_data="ob_menu")]]))
                 return
             if ob_wait == "symbol_budget_edit":
                 symbol=context.user_data.pop("ob_budget_edit_symbol",None)
@@ -1027,47 +1027,58 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 wall = float(o.get("wall") or 0); wall_usdt = float(o.get("wall_usdt") or 0)
                 kind = "محاكاة PAPER" if o.get("paper") else f"أمر MEXC #{o.get('id','?')}"
                 order_lines.append(f"• {sym}: {kind} | سعر الأمر {float(o['price']):.10g} | الجدار {wall:.10g} (${wall_usdt:.2f}) | الميزانية ${float(o['budget']):.2f}")
-            wall_lines = []
-            for sym in st["running_symbols"]:
-                ws = st.get("wall_status", {}).get(sym, {})
-                if not ws:
-                    wall_lines.append(f"• {sym}: لم تصل قراءة دفتر الأوامر بعد")
-                    continue
-                bid, ask = ws.get("bid"), ws.get("ask")
-                market_text = (f"Bid {float(bid):.10g} / Ask {float(ask):.10g}" if bid and ask else "السعر الحالي غير متاح")
-                if sym in positions:
-                    p=positions[sym]
-                    sell_price, sell_usdt = ws.get("sell_wall_price"), ws.get("sell_wall_usdt")
-                    sell_text = (f"أفضل جدار بيعي {float(sell_price):.10g} (${float(sell_usdt or 0):.2f}, قوة {float(ws.get('sell_wall_multiple') or 0):.1f}x)" if sell_price else "لا يوجد جدار بيعي مؤهل حاليًا")
-                    wall_lines.append(f"• {sym}: 🟢 مركز مفتوح | دخول {float(p.get('entry') or 0):.10g} | {market_text} | {sell_text} | {ws.get('reason','')} ")
-                elif sym in st["entry_orders"]:
-                    entry=st["entry_orders"][sym]
-                    wall_lines.append(f"• {sym}: 🟡 انتظار دخول عند {float(entry.get('price') or 0):.10g} | الجدار {float(entry.get('wall') or 0):.10g} (${float(entry.get('wall_usdt') or 0):.2f}) | {market_text} | {ws.get('reason','')} ")
-                else:
-                    wp, wv = ws.get("wall_price"), ws.get("wall_usdt")
-                    wall_text = f"جدار شراء {float(wp):.10g} (${float(wv or 0):.2f}, قوة {float(ws.get('wall_multiple') or 0):.1f}x)" if wp else "لا يوجد جدار شراء مؤهل حاليًا"
-                    wall_lines.append(f"• {sym}: 🔎 انتظار دخول | {market_text} | {wall_text} | تأكيدات {int(ws.get('confirmations') or 0)} | {ws.get('reason','بانتظار القراءة')} ")
             active_text = "\n".join(position_lines + order_lines) or "لا توجد مراكز أو أوامر دخول معلقة"
-            wall_text_block = "\n".join(wall_lines) or "لا توجد حالة جدار متاحة بعد"
             budgets = st["budgets"]
             configured = "\n".join(f"• {sym}: ميزانية ${budgets.get(sym, 0):.2f} | {'🟢 يعمل' if sym in st['running_symbols'] else '⚪ متوقف'}" for sym in st["symbols"]) or "لا توجد عملات مضافة"
             msg = (f"🧱 ORDER BOOK LIQUIDITY SNIPER\nالحالة: {'🟢 يعمل' if st['enabled'] else '⚪ متوقف'}\n"
                    f"الوضع: {mode}\nالحد الأدنى للأمر: ${settings.min_order_usdt:g}\n"
                    f"المراكز/الأوامر النشطة: {len(set(positions) | set(st['entry_orders']))}/20\n"
                    f"مدة آخر دورة: {st['scan_sec']:.2f}s\nPnL المحقق/تقريبي: ${st['realized']:.4f}\n"
-                   f"آخر خطأ: {st['last_error'] or 'لا يوجد'}\n\n*العملات المختارة والميزانيات*\n{configured}\n\n*المتابعة الحية لكل عملة*\n{wall_text_block}\n\n*المراكز والأوامر*\n{active_text}")
+                   f"آخر خطأ: {st['last_error'] or 'لا يوجد'}\n\n*العملات المختارة والميزانيات*\n{configured}\n\n*المراكز والأوامر*\n{active_text}\n\nاضغط زر المتابعة الحية لرؤية تفاصيل كل عملة.")
             kb=InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ إضافة عملة + ميزانية",callback_data="ob_coin"),InlineKeyboardButton("📊 إدارة الصفقات",callback_data="ob_manage")],
+                [InlineKeyboardButton("📡 المتابعة الحية لكل عملة",callback_data="ob_live")],
                 [InlineKeyboardButton("▶️ تشغيل العملات المحددة",callback_data="ob_start"),InlineKeyboardButton("⏹ إيقاف الكل",callback_data="ob_stop")],
                 [InlineKeyboardButton("⚙️ إعدادات التداول",callback_data="ob_settings"),InlineKeyboardButton(f"⚡ الوضع: {settings.mode}",callback_data="ob_mode")],
                 [InlineKeyboardButton(f"🎯 TP {settings.tp_pct:g}%",callback_data="ob_tp"),InlineKeyboardButton(f"🛑 SL {settings.sl_pct:g}%",callback_data="ob_sl")],
                 [InlineKeyboardButton("🔐 تأكيد LIVE",callback_data="ob_arm"),InlineKeyboardButton("🔄 تحديث",callback_data="ob_status")],
                 [InlineKeyboardButton("↩️ الرئيسية",callback_data="menu")]])
             await query.edit_message_text(msg,reply_markup=kb,parse_mode="Markdown"); return
+        if data == "ob_live":
+            st=sniper.status(); cards=[]; buttons=[]
+            for sym in st["symbols"]:
+                ws=st.get("wall_status",{}).get(sym,{})
+                if sym in st["positions"]:
+                    p=st["positions"][sym]; sell=ws.get("sell_wall_price")
+                    card=f"*{sym}*\n🟢 *مركز مفتوح*\nسعر الدخول: `{float(p.get('entry') or 0):.10g}` USDT\nالكمية: `{float(p.get('amount') or 0):.10g}`\n"
+                    card += f"أفضل جدار بيعي: `{float(sell):.10g}` USDT" if sell else "أفضل جدار بيعي: لا يوجد حاليًا"
+                elif sym in st["entry_orders"]:
+                    o=st["entry_orders"][sym]
+                    card=(f"*{sym}*\n🟡 *أمر دخول معلّق*\nسعر الدخول: `{float(o.get('price') or 0):.10g}` USDT\n"
+                          f"جدار الشراء: `{float(o.get('wall') or 0):.10g}` USDT\nقيمة الجدار: `${float(o.get('wall_usdt') or 0):.2f}`")
+                else:
+                    wall=ws.get("wall_price")
+                    card=f"*{sym}*\n🔎 *انتظار دخول*\n"
+                    card += f"الجدار المرصود: `{float(wall):.10g}` USDT\nالتأكيدات: `{int(ws.get('confirmations') or 0)}`" if wall else "لا يوجد جدار شراء مؤهل حاليًا"
+                card += f"\nالميزانية: `${st['budgets'].get(sym,0):.2f}` USDT\nالشرح: {ws.get('reason','بانتظار القراءة')}"
+                cards.append(card); buttons.append([InlineKeyboardButton(f"🔍 تفاصيل {sym}",callback_data="ob_live_detail_"+sym.replace("/","~"))])
+            buttons += [[InlineKeyboardButton("🔄 تحديث المتابعة",callback_data="ob_live")],[InlineKeyboardButton("↩️ الرئيسية",callback_data="ob_menu")]]
+            await query.edit_message_text("📡 *المتابعة الحية لكل عملة*\n\n"+("\n\n────────────\n\n".join(cards) or "لا توجد عملات مضافة."),reply_markup=InlineKeyboardMarkup(buttons),parse_mode="Markdown"); return
+        if data.startswith("ob_live_detail_"):
+            sym=data[len("ob_live_detail_"):].replace("~","/").upper(); st=sniper.status(); ws=st.get("wall_status",{}).get(sym,{})
+            lines=[f"📡 *تفاصيل المتابعة — {sym}*",f"الميزانية: `${st['budgets'].get(sym,0):.2f}` USDT",f"الحالة: {ws.get('reason','بانتظار القراءة')}"]
+            if sym in st["positions"]:
+                p=st["positions"][sym]; lines += ["الوضع: 🟢 مركز مفتوح",f"سعر الدخول: `{float(p.get('entry') or 0):.10g}` USDT",f"الكمية: `{float(p.get('amount') or 0):.10g}`"]
+                lines.append(f"أفضل جدار بيعي: `{float(ws['sell_wall_price']):.10g}` USDT" if ws.get("sell_wall_price") else "أفضل جدار بيعي: لا يوجد حاليًا")
+            elif sym in st["entry_orders"]:
+                o=st["entry_orders"][sym]; lines += ["الوضع: 🟡 أمر دخول معلّق",f"سعر الدخول المحدد: `{float(o.get('price') or 0):.10g}` USDT",f"جدار الشراء: `{float(o.get('wall') or 0):.10g}` USDT",f"قيمة الجدار: `${float(o.get('wall_usdt') or 0):.2f}`"]
+            else:
+                lines += ["الوضع: 🔎 انتظار دخول",f"التأكيدات: `{int(ws.get('confirmations') or 0)}`"]
+            await query.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ كل العملات",callback_data="ob_live")],[InlineKeyboardButton("🏠 الرئيسية",callback_data="ob_menu")]]),parse_mode="Markdown"); return
         if data == "ob_settings":
             kb=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"📌 أقصى مراكز {min(20,settings.max_positions)} / 20",callback_data="ob_maxpos"),InlineKeyboardButton(f"↔️ أقصى سبريد {settings.max_spread_pct:g}%",callback_data="ob_spread")],
-                [InlineKeyboardButton(f"🧱 قوة الجدار {settings.wall_multiple:g}x",callback_data="ob_wall"),InlineKeyboardButton(f"📍 بُعد الجدار {settings.max_wall_distance_pct:g}%",callback_data="ob_distance")],
+                [InlineKeyboardButton(f"📌 أقصى عدد مراكز {min(20,settings.max_positions)} / 20",callback_data="ob_maxpos"),InlineKeyboardButton(f"↔️ فرق السعر المقبول {settings.max_spread_pct:g}%",callback_data="ob_spread")],
+                [InlineKeyboardButton(f"🧱 قوة الجدار المطلوبة {settings.wall_multiple:g} مرات",callback_data="ob_wall"),InlineKeyboardButton(f"📍 بُعد الجدار المقبول {settings.max_wall_distance_pct:g}%",callback_data="ob_distance")],
                 [InlineKeyboardButton(f"🎯 هدف الربح {settings.tp_pct:g}%",callback_data="ob_tp"),InlineKeyboardButton(f"🛑 وقف الخسارة {settings.sl_pct:g}%",callback_data="ob_sl")],
                 [InlineKeyboardButton("↩️ رجوع",callback_data="ob_menu")]])
             await query.edit_message_text("⚙️ إعدادات التداول\nكل عملة لها ميزانيتها الخاصة. لا يوجد فحص شامل للسوق: البوت يتابع العملات التي تضيفها فقط. اضغط إعدادًا ثم أرسل القيمة الجديدة.",reply_markup=kb); return
@@ -1104,7 +1115,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if pending:
                     detail=f"تم إنشاء أمر دخول {'محاكي PAPER' if pending.get('paper') else 'على MEXC'} عند {float(pending['price']):.10g} USDT. الجدار: {float(pending.get('wall') or 0):.10g} بقيمة ${float(pending.get('wall_usdt') or 0):.2f}."
                 else:
-                    detail=f"السعر الحالي: Bid {float(ws.get('bid') or 0):.10g} / Ask {float(ws.get('ask') or 0):.10g}. {ws.get('reason','سيؤكد الجدار في القراءة التالية')}"
+                    detail=f"الحالة الحالية: {ws.get('reason','سيؤكد الجدار في القراءة التالية')}"
                 await query.edit_message_text(f"▶️ بدأ تشغيل {sym}.\nالميزانية: ${get_symbol_budgets(tid).get(sym,0):.2f}\n{detail}\nسيواصل البوت التحقق تلقائيًا كل دورتين ثانية.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 إدارة الصفقات",callback_data="ob_manage"),InlineKeyboardButton("🔄 الحالة",callback_data="ob_status")]]))
             except Exception as e:
                 await query.edit_message_text(f"تعذر تشغيل {sym}: {str(e)[:180]}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("رجوع",callback_data="ob_manage")]]))
@@ -1149,7 +1160,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data in ("ob_size","ob_tp","ob_sl","ob_maxpos","ob_spread","ob_wall","ob_distance"):
             key={"ob_size":"order_usdt","ob_tp":"tp_pct","ob_sl":"sl_pct","ob_maxpos":"max_positions","ob_spread":"max_spread_pct","ob_wall":"wall_multiple","ob_distance":"max_wall_distance_pct"}[data]
             context.user_data["ob_waiting"]=key
-            label={"order_usdt":"الميزانية الافتراضية بالدولار (كل عملة لها ميزانية مستقلة، والحد الأدنى 2 USDT)","tp_pct":"هدف الربح %","sl_pct":"وقف الخسارة %","max_positions":"أقصى عدد للمراكز (1 إلى 20)","max_spread_pct":"أقصى سبريد %","wall_multiple":"قوة جدار السيولة مقارنة بالمستويات المجاورة (مثلاً 3)","max_wall_distance_pct":"أقصى مسافة عن جدار السيولة %"}[key]
+            label={"order_usdt":"الميزانية الافتراضية بالدولار (كل عملة لها ميزانية مستقلة، والحد الأدنى 2 USDT)","tp_pct":"هدف الربح %","sl_pct":"وقف الخسارة %","max_positions":"أقصى عدد للمراكز (1 إلى 20)","max_spread_pct":"أقصى فرق سعر مقبول % (القيمة المناسبة غالبًا 1.2)","wall_multiple":"قوة جدار السيولة مقارنة بالمستويات المجاورة (مثلاً 3 مرات)","max_wall_distance_pct":"أقصى مسافة مقبولة عن الجدار %"}[key]
             await query.edit_message_text("أرسل "+label+".",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء",callback_data="ob_settings")]])); return
         return
     # توحيد أي زر قديم محفوظ في رسائل Telegram مع شاشة الحيتان الرئيسية.

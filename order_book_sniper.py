@@ -21,9 +21,10 @@ class OrderBookSettings(Base):
     tp_pct = Column(Float, default=0.35, nullable=False)
     sl_pct = Column(Float, default=0.25, nullable=False)
     min_24h_volume_usdt = Column(Float, default=1000000.0, nullable=False)  # legacy only
-    max_spread_pct = Column(Float, default=0.15, nullable=False)
+    # 1.2% accommodates thin/small-cap pairs while still avoiding extreme gaps.
+    max_spread_pct = Column(Float, default=1.2, nullable=False)
     wall_multiple = Column(Float, default=3.0, nullable=False)
-    max_wall_distance_pct = Column(Float, default=0.45, nullable=False)
+    max_wall_distance_pct = Column(Float, default=1.0, nullable=False)
     scan_symbols = Column(Integer, default=12, nullable=False)  # legacy only
     watch_symbols = Column(String(1000), default="", nullable=False)
     symbol_budgets = Column(String(4000), default="{}", nullable=False)
@@ -55,6 +56,11 @@ def get_settings(tid):
         s=db.query(OrderBookSettings).filter_by(telegram_id=int(tid)).first()
         if not s:
             s=OrderBookSettings(telegram_id=int(tid)); db.add(s); db.commit(); db.refresh(s)
+        # Migrate the old overly strict defaults for existing users once.
+        if float(s.max_spread_pct or 0) == 0.15:
+            s.max_spread_pct=1.2
+            if float(s.max_wall_distance_pct or 0) == 0.45: s.max_wall_distance_pct=1.0
+            db.commit(); db.refresh(s)
         return s
     finally: db.close()
 
@@ -218,7 +224,7 @@ class OrderBookSniper:
             self.wall_status[sym]={"state":"bad_book","bid":bid,"ask":ask,"reason":"أسعار دفتر الأوامر غير صالحة","updated":time.time()}; self._save_runtime(); return
         spread=(ask-bid)/((ask+bid)/2)*100
         if spread>s.max_spread_pct:
-            self.wall_status[sym]={"state":"spread_rejected","bid":bid,"ask":ask,"spread_pct":spread,"reason":f"السبريد {spread:.4f}% أكبر من الحد {s.max_spread_pct:g}%","updated":time.time()}; self._save_runtime(); return
+            self.wall_status[sym]={"state":"spread_rejected","bid":bid,"ask":ask,"spread_pct":spread,"reason":f"فرق السعر {spread:.4f}% أكبر من الحد {s.max_spread_pct:g}%","updated":time.time()}; self._save_runtime(); return
         bw=self._wall(bids,s.wall_multiple); aw=self._wall(asks,s.wall_multiple)
         mid=(bid+ask)/2
         near_bids=[x for x in bw if 0 < (mid-x[0])/mid*100 <= s.max_wall_distance_pct]
