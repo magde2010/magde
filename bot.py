@@ -5,6 +5,7 @@
 import logging
 import re
 import asyncio
+import json
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 
@@ -20,6 +21,21 @@ from telegram.ext import (
 )
 
 import config
+import crash_hunter
+from crash_hunter import (
+    parse_levels, default_manual_levels, analyze_market_for_auto,
+    place_crash_ladder, cancel_crash_orders, format_result as format_crash_result,
+    update_settings as crash_update_settings, get_settings as crash_get_settings,
+    monitor_crash_fills, status_summary as crash_status_summary,
+)
+import smart_whale_control
+from whale_reco import (
+    fetch_recommendations, format_reco_message,
+    whale_auto_start, whale_auto_stop, whale_status_text, whale_auto_tick,
+    get_whale_runtime, WhaleAutoSettings, save_whale_state,
+    whale_settings_dict, apply_whale_settings,
+)
+from whale_reco import fetch_recommendations, format_reco_message
 from database import (
     init_db, SessionLocal, get_or_create_user, get_portfolios, get_portfolio,
     create_portfolio, add_coin_to_portfolio, remove_coin_from_portfolio,
@@ -39,6 +55,7 @@ import ui_theme as ui
 from liquidity_swings import init_liquidity_db
 from portfolio_controls import calculate_portfolio_entry_budget, calculate_safe_trim_amount, calculate_outstanding_trim_amounts
 from liquidity_swings_telegram import handle_liquidity_callback, handle_liquidity_text, liquidity_scan_job
+from order_book_sniper import get_sniper, get_settings as get_ob_settings, update_settings as update_ob_settings
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -109,6 +126,39 @@ def _outstanding_trim_amounts(db, portfolio_id: int, telegram_id: int):
 
 
 
+def _persist_whale_settings(telegram_id: int) -> None:
+    """Store whale settings in the durable application database."""
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, telegram_id)
+        user.whale_auto_settings_json = json.dumps(
+            whale_settings_dict(), ensure_ascii=False, sort_keys=True
+        )
+        user.smart_whale_settings_json = json.dumps(
+            smart_whale_control.load_settings(), ensure_ascii=False, sort_keys=True
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _load_whale_settings(telegram_id: int) -> None:
+    """Restore durable whale settings, leaving file-based state as fallback."""
+    db = SessionLocal()
+    try:
+        user = db.query(UserSettings).filter(UserSettings.telegram_id == telegram_id).first()
+        if not user:
+            return
+        if user.whale_auto_settings_json:
+            apply_whale_settings(json.loads(user.whale_auto_settings_json))
+        if user.smart_whale_settings_json:
+            smart_whale_control.apply_settings(json.loads(user.smart_whale_settings_json))
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        logger.warning("load whale settings: %s", exc)
+    finally:
+        db.close()
+
+
 def get_mexc() -> MexcClient:
     global _mexc
     if _mexc is None:
@@ -150,7 +200,9 @@ def get_reb() -> Rebalancer:
 
 
 def is_admin(user_id: int) -> bool:
-    return bool(config.ADMIN_TELEGRAM_ID) and user_id == config.ADMIN_TELEGRAM_ID
+    if not config.ADMIN_TELEGRAM_ID:
+        return True
+    return user_id == config.ADMIN_TELEGRAM_ID
 
 
 async def ensure_admin(update: Update) -> bool:
@@ -169,6 +221,7 @@ def main_menu_keyboard():
         ui.row((f"{ui.I['portfolio']}  المحافظ", "list_pf"), (f"{ui.I['new']}  محفظة جديدة", "create_pf")),
         ui.row((f"{ui.I['balance']}  الرصيد", "balance"), (f"{ui.I['settings']}  الإعدادات", "settings")),
         [ui.button("💧  Liquidity Swings MTF · Spot", "liq_home")],
+        [ui.button("🧱  Order Book Liquidity Sniper", "ob_menu")],
         [ui.button(f"{ui.I['cleanup']}  تنظيف البيانات", "cleanup_db")],
     ])
 
@@ -627,7 +680,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.close()
     await update.message.reply_text(
         ui.page_title("◆", "LOTFE", "إدارة محافظ MEXC Spot بواجهة عصرية وواضحة.") +
-        "\nإدارة المحافظ • Liquidity Swings MTF\n"
+        "\nإدارة المحافظ • التداول الفوري • Flow Engine\n"
         "اختر القسم المطلوب من القائمة أدناه.",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard(),
@@ -657,11 +710,189 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     tid = update.effective_user.id
 
+    ob_wait = context.user_data.pop("ob_waiting", None)
+    if ob_wait:
+        try:
+            value = float(text.strip().replace("$","").replace("%","").replace(",","."))
+            if value <= 0: raise ValueError("القيمة يجب أن تكون أكبر من صفر")
+            if ob_wait == "order_usdt":
+                value=max(2.0,value)
+            update_ob_settings(tid, **{ob_wait:value})
+            await update.message.reply_text("تم حفظ الإعداد.")
+        except Exception as e:
+            await update.message.reply_text(f"قيمة غير صالحة: {e}")
+        return
+
     if await handle_liquidity_text(update, context, get_mexc):
         return
 
     if context.user_data.get("waiting"):
         # تعديل إعدادات عامة
+        # إعداد نسب اصطياد الانهيار اليدوي
+        crash_wait = context.user_data.get("crash_wait")
+        if crash_wait:
+            pf_id = int(crash_wait.get("pf_id") or 0)
+            kind = crash_wait.get("kind")  # levels | budget | max_coin | tp | sl
+            try:
+                if kind == "levels":
+                    levels = parse_levels(text)
+                    if not levels:
+                        await update.message.reply_text(
+                            "صيغة غير مفهومة. مثال: `-10,-20`",
+                            reply_markup=main_menu_keyboard(),
+                        )
+                        return
+                    context.user_data["crash_levels"] = levels
+                    crash_update_settings(levels_pct=levels)
+                    context.user_data.pop("crash_wait", None)
+                    context.user_data.pop("waiting", None)
+                    await update.message.reply_text(
+                        f"✅ نسب السلم: `{', '.join(str(x) for x in levels)}` %\nمن القائمة → اصطياد → تشغيل",
+                        parse_mode="Markdown",
+                        reply_markup=main_menu_keyboard(),
+                    )
+                    return
+                if kind == "budget":
+                    val = float(text.strip().replace(",", ".").replace("$", ""))
+                    val = max(10.0, min(100000.0, val))
+                    context.user_data["crash_budget"] = val
+                    crash_update_settings(budget_usdt=val)
+                    context.user_data.pop("crash_wait", None)
+                    context.user_data.pop("waiting", None)
+                    await update.message.reply_text(
+                        f"✅ ميزانية الاصطياد: `{val:g}$`",
+                        parse_mode="Markdown",
+                        reply_markup=main_menu_keyboard(),
+                    )
+                    return
+                if kind == "max_coin":
+                    val = float(text.strip().replace(",", ".").replace("$", ""))
+                    val = max(5.0, min(10000.0, val))
+                    crash_update_settings(max_per_coin_usdt=val)
+                    context.user_data.pop("crash_wait", None)
+                    context.user_data.pop("waiting", None)
+                    await update.message.reply_text(
+                        f"✅ سقف لكل عملة: `{val:g}$`",
+                        parse_mode="Markdown",
+                        reply_markup=main_menu_keyboard(),
+                    )
+                    return
+                if kind == "tp":
+                    val = float(text.strip().replace(",", ".").replace("%", ""))
+                    val = max(1.0, min(100.0, val))
+                    crash_update_settings(tp_pct=val)
+                    context.user_data.pop("crash_wait", None)
+                    context.user_data.pop("waiting", None)
+                    await update.message.reply_text(
+                        f"✅ هدف بعد الامتلاء: `{val:g}%`",
+                        parse_mode="Markdown",
+                        reply_markup=main_menu_keyboard(),
+                    )
+                    return
+                if kind == "sl":
+                    val = float(text.strip().replace(",", ".").replace("%", ""))
+                    val = max(1.0, min(50.0, val))
+                    crash_update_settings(sl_pct=val)
+                    context.user_data.pop("crash_wait", None)
+                    context.user_data.pop("waiting", None)
+                    await update.message.reply_text(
+                        f"✅ وقف بعد الامتلاء: `{val:g}%`",
+                        parse_mode="Markdown",
+                        reply_markup=main_menu_keyboard(),
+                    )
+                    return
+            except Exception as e:
+                await update.message.reply_text(f"خطأ: {e}")
+                return
+
+        smart_wait = context.user_data.get("smart_whale_wait")
+        if smart_wait:
+            field = smart_wait.get("field")
+            raw = text.strip()
+            try:
+                if field == "radar_window":
+                    value = raw.lower().replace(" ", "")
+                    if value not in {"1h", "4h", "12h", "24h", "7d"}:
+                        raise ValueError("القيم المسموحة: 1h أو 4h أو 12h أو 24h أو 7d")
+                else:
+                    number = float(raw.replace(",", ".").replace("$", "").replace("%", ""))
+                    bounds = {
+                        "allocated_capital": (10.0, 1_000_000.0),
+                        "position_size_usdt": (5.0, 100_000.0),
+                        "max_open_positions": (1.0, 50.0),
+                        "min_multiple": (1.0, 100.0),
+                        "stop_loss_pct": (0.1, 90.0),
+                        "take_profit_1_pct": (0.1, 500.0),
+                        "take_profit_2_pct": (0.1, 1000.0),
+                        "check_interval_minutes": (1.0, 1440.0),
+                        "min_order_usdt": (1.0, 1000.0),
+                        "max_slippage_pct": (0.1, 20.0),
+                    }
+                    low, high = bounds[field]
+                    if not low <= number <= high:
+                        raise ValueError(f"القيمة يجب أن تكون بين {low:g} و {high:g}")
+                    value = int(number) if field in {"max_open_positions", "check_interval_minutes"} else number
+                smart_whale_control.update_setting(field, value)
+                _persist_whale_settings(tid)
+                context.user_data.pop("smart_whale_wait", None)
+                context.user_data.pop("waiting", None)
+                await update.message.reply_text(
+                    f"✅ تم حفظ إعداد *{smart_whale_control.FIELD_LABELS[field]}*.\n"
+                    "سيُطبّق عند تشغيل النظام التالي.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")],
+                    ]),
+                )
+            except Exception as exc:
+                await update.message.reply_text(
+                    f"❌ قيمة غير صحيحة: `{str(exc)}`",
+                    parse_mode="Markdown",
+                )
+            return
+
+        whale_field = context.user_data.get("edit_whale_field")
+        if whale_field:
+            try:
+                raw = text.strip().replace(",", ".").replace("%", "").replace("$", "")
+                rt = get_whale_runtime()
+                s = rt.settings
+                if whale_field == "size":
+                    s.size_usdt = max(5.0, min(5000.0, float(raw))); val = s.size_usdt
+                elif whale_field == "max":
+                    s.max_positions = max(1, min(20, int(float(raw)))); val = s.max_positions
+                elif whale_field == "score":
+                    s.min_score = max(65.0, min(95.0, float(raw))); val = s.min_score
+                elif whale_field == "confirm":
+                    s.confirmations_required = max(1, min(5, int(float(raw)))); val = s.confirmations_required
+                elif whale_field == "liveconfirm":
+                    s.live_confirmations_required = max(2, min(5, int(float(raw)))); val = s.live_confirmations_required
+                elif whale_field == "tp":
+                    s.take_profit_pct = max(1.0, min(50.0, float(raw))); val = s.take_profit_pct
+                elif whale_field == "sl":
+                    s.stop_loss_pct = max(1.0, min(30.0, float(raw))); val = s.stop_loss_pct
+                elif whale_field == "interval":
+                    s.scan_interval_seconds = max(15, min(3600, int(float(raw)))); val = s.scan_interval_seconds
+                elif whale_field == "exposure":
+                    s.max_exposure_usdt = max(0.0, min(1000000.0, float(raw))); val = s.max_exposure_usdt
+                else:
+                    await update.message.reply_text("حقل غير معروف")
+                    return
+                save_whale_state()
+                _persist_whale_settings(tid)
+                context.user_data.pop("edit_whale_field", None)
+                context.user_data.pop("waiting", None)
+                await update.message.reply_text(
+                    f"✅ حيتان: `{whale_field}` = `{val}`",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")],
+                    ]),
+                )
+            except Exception as e:
+                await update.message.reply_text(f"خطأ: {e}")
+            return
+
         user_field = context.user_data.get("edit_user_tpsl")
         if user_field:
             try:
@@ -745,6 +976,57 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("liq_"):
         await handle_liquidity_callback(update, context, get_mexc)
         return
+    if data.startswith("ob_"):
+        sniper = get_sniper(tid)
+        settings = get_ob_settings(tid)
+        if data == "ob_menu" or data == "ob_status":
+            st = sniper.status()
+            mode = "🟡 PAPER" if settings.mode == "PAPER" else "🔴 LIVE"
+            positions = st["positions"]
+            pos_text = "\\n".join(f"• {sym}: entry {p['entry']:.8g}, value ${p['cost']:.2f}" for sym,p in positions.items()) or "لا توجد مراكز"
+            msg = (f"🧱 ORDER BOOK LIQUIDITY SNIPER\\nالحالة: {'🟢 يعمل' if st['enabled'] else '⚪ متوقف'}\\n"
+                   f"الوضع: {mode}\\nحجم الأمر: ${settings.order_usdt:g} (الحد الأدنى ${settings.min_order_usdt:g})\\n"
+                   f"المراكز: {len(positions)}/{settings.max_positions}\\nالأزواج المفحوصة: {st['scanned']}\\n"
+                   f"مدة آخر دورة: {st['scan_sec']:.2f}s\\nPnL المحقق/تقريبي: ${st['realized']:.4f}\\n"
+                   f"آخر خطأ: {st['last_error'] or 'لا يوجد'}\\n\\n{pos_text}")
+            kb=InlineKeyboardMarkup([
+                [InlineKeyboardButton("▶️ تشغيل",callback_data="ob_start"),InlineKeyboardButton("⏹ إيقاف",callback_data="ob_stop")],
+                [InlineKeyboardButton(f"⚡ الوضع: {settings.mode}",callback_data="ob_mode"),InlineKeyboardButton(f"💰 حجم الأمر ${settings.order_usdt:g}",callback_data="ob_size")],
+                [InlineKeyboardButton(f"🎯 TP {settings.tp_pct:g}%",callback_data="ob_tp"),InlineKeyboardButton(f"🛑 SL {settings.sl_pct:g}%",callback_data="ob_sl")],
+                [InlineKeyboardButton("🔐 تأكيد السماح بـ LIVE",callback_data="ob_arm"),InlineKeyboardButton("🔄 تحديث",callback_data="ob_status")],
+                [InlineKeyboardButton("↩️ الرئيسية",callback_data="menu")]])
+            await query.edit_message_text(msg,reply_markup=kb); return
+        if data == "ob_start":
+            try:
+                sniper.start(get_mexc())
+                await query.edit_message_text("تم تشغيل ماسح دفتر الأوامر. الوضع الحالي: "+settings.mode,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 الحالة",callback_data="ob_status")]]))
+            except Exception as e:
+                await query.edit_message_text(f"تعذر التشغيل: {e}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ رجوع",callback_data="ob_menu")]]))
+            return
+        if data == "ob_stop":
+            sniper.stop(); await query.edit_message_text("تم إيقاف ماسح دفتر الأوامر.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 الحالة",callback_data="ob_menu")]])); return
+        if data == "ob_mode":
+            if settings.mode == "PAPER":
+                update_ob_settings(tid,mode="LIVE",live_confirmed=False)
+                msg="تم اختيار LIVE لكن التنفيذ الحقيقي ما زال مقفولًا حتى تضغط تأكيد LIVE. اختبر PAPER أولًا."
+            else:
+                update_ob_settings(tid,mode="PAPER",live_confirmed=False); msg="تم الرجوع إلى PAPER."
+            await query.edit_message_text(msg,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 الرجوع للاستراتيجية",callback_data="ob_menu")]])); return
+        if data == "ob_arm":
+            if settings.mode != "LIVE":
+                await query.edit_message_text("حوّل الوضع إلى LIVE أولًا، ثم أكد السماح.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("رجوع",callback_data="ob_menu")]])); return
+            update_ob_settings(tid,live_confirmed=True)
+            await query.edit_message_text("تم تأكيد LIVE. سيظل التنفيذ محدودًا بشروط الاستراتيجية وإدارة المخاطر.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 الحالة",callback_data="ob_menu")]])); return
+        if data in ("ob_size","ob_tp","ob_sl"):
+            key={"ob_size":"order_usdt","ob_tp":"tp_pct","ob_sl":"sl_pct"}[data]
+            context.user_data["ob_waiting"]=key
+            label={"order_usdt":"حجم الأمر بالدولار (USDT، 2 كحد أدنى)","tp_pct":"هدف الربح بالنسبة المئوية","sl_pct":"وقف الخسارة بالنسبة المئوية"}[key]
+            await query.edit_message_text("أرسل "+label+"."); return
+        return
+    # توحيد أي زر قديم محفوظ في رسائل Telegram مع شاشة الحيتان الرئيسية.
+    if data == "smart_whale_menu":
+        data = "whale_reco_menu"
+
     if data == "menu":
         await query.edit_message_text(
             ui.page_title(ui.I["home"], "لوحة التحكم", "اختار القسم المطلوب من القائمة:") + ui.footer(),
@@ -778,6 +1060,417 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             db.close()
         return
+    # ========== اصطياد الانهيار (نظام عام لكل المحافظ) ==========
+    if data == "crash_sys" or data == "crash_menu":
+        levels = context.user_data.get("crash_levels") or default_manual_levels()
+        budget = float(context.user_data.get("crash_budget") or 0)
+        db = SessionLocal()
+        try:
+            pfs = get_portfolios(db, tid, status="active") or []
+            symbols = []
+            seen = set()
+            for p in pfs:
+                for c in (p.coins or []):
+                    s = (c.symbol or "").upper()
+                    if s and s not in seen:
+                        seen.add(s)
+                        symbols.append(s)
+            cs = crash_get_settings()
+            if budget < 10:
+                budget = float(cs.budget_usdt or 50)
+            text = (
+                ui.page_title(ui.I["crash"], "اصطياد الهبوط", "نظام عام يطبق على عملات كل المحافظ.") + "\n"
+                f"يُطبَّق *مرة واحدة* على عملات *كل المحافظ*\n"
+                f"المحافظ: `{len(pfs)}` | العملات: `{len(symbols)}`\n"
+                f"ميزانية: `{budget:.0f}$` | سقف/عملة: `{cs.max_per_coin_usdt:g}$`\n"
+                f"السلم: `{', '.join(str(x) for x in levels)}` %\n"
+                f"بعد الامتلاء: هدف `{cs.tp_pct:g}%` | وقف `{cs.sl_pct:g}%`\n"
+                f"{crash_status_summary()}\n\n"
+                f"_بعد الامتلاء: هدف حد + مراقبة وقف._"
+            )
+            rows = [
+                [InlineKeyboardButton(f"{ui.I['play']}  تشغيل يدوي", callback_data="crash_run_sys")],
+                [InlineKeyboardButton(f"{ui.I['play']}  تشغيل تلقائي", callback_data="crash_auto_sys")],
+                [
+                    InlineKeyboardButton("⚙  السلم", callback_data="crash_set_levels_sys"),
+                    InlineKeyboardButton("💵 ميزانية", callback_data="crash_set_budget_sys"),
+                ],
+                [
+                    InlineKeyboardButton("سقف/عملة", callback_data="crash_set_max_sys"),
+                    InlineKeyboardButton("هدف%", callback_data="crash_set_tp_sys"),
+                    InlineKeyboardButton("وقف%", callback_data="crash_set_sl_sys"),
+                ],
+                [InlineKeyboardButton(f"{ui.I['stop']}  إلغاء الأوامر المعلّقة", callback_data="crash_cancel_sys")],
+                [InlineKeyboardButton(f"{ui.I['back']}  القائمة", callback_data="menu")],
+            ]
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+        finally:
+            db.close()
+        return
+
+    if data == "crash_set_levels_sys" or data.startswith("crash_set_levels_"):
+        context.user_data["waiting"] = True
+        context.user_data["crash_wait"] = {"pf_id": 0, "kind": "levels"}
+        await query.edit_message_text(
+            "أرسل نسب السلم مفصولة بفاصلة.\nمثال: `-10,-20`",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{ui.I['back']}  رجوع", callback_data="crash_sys")],
+            ]),
+        )
+        return
+
+    if data == "crash_set_budget_sys" or data.startswith("crash_set_budget_"):
+        context.user_data["waiting"] = True
+        context.user_data["crash_wait"] = {"pf_id": 0, "kind": "budget"}
+        await query.edit_message_text(
+            "أرسل ميزانية الاصطياد بالدولار (مستقلة عن مخصص المحافظ).",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{ui.I['back']}  رجوع", callback_data="crash_sys")],
+            ]),
+        )
+        return
+
+    if data == "crash_set_max_sys":
+        context.user_data["waiting"] = True
+        context.user_data["crash_wait"] = {"pf_id": 0, "kind": "max_coin"}
+        await query.edit_message_text(
+            "أرسل سقف المبلغ لكل عملة بالدولار (مثال: 25).",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{ui.I['back']}  رجوع", callback_data="crash_sys")],
+            ]),
+        )
+        return
+
+    if data == "crash_set_tp_sys":
+        context.user_data["waiting"] = True
+        context.user_data["crash_wait"] = {"pf_id": 0, "kind": "tp"}
+        await query.edit_message_text(
+            "أرسل نسبة الهدف بعد امتلاء أمر الاصطياد (مثال: 8).",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{ui.I['back']}  رجوع", callback_data="crash_sys")],
+            ]),
+        )
+        return
+
+    if data == "crash_set_sl_sys":
+        context.user_data["waiting"] = True
+        context.user_data["crash_wait"] = {"pf_id": 0, "kind": "sl"}
+        await query.edit_message_text(
+            "أرسل نسبة الوقف تحت سعر الامتلاء (مثال: 5).",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{ui.I['back']}  رجوع", callback_data="crash_sys")],
+            ]),
+        )
+        return
+
+    if data == "crash_run_sys" or data.startswith("crash_run_"):
+        db = SessionLocal()
+        try:
+            pfs = get_portfolios(db, tid, status="active") or []
+            symbols = []
+            seen = set()
+            for p in pfs:
+                for c in (p.coins or []):
+                    s = (c.symbol or "").upper()
+                    if s and s not in seen:
+                        seen.add(s)
+                        symbols.append(s)
+            if not symbols:
+                await query.edit_message_text(
+                    "لا عملات في المحافظ. أنشئ محافظ وأضف عملات أولاً.",
+                    reply_markup=main_menu_keyboard(),
+                )
+                return
+            levels = context.user_data.get("crash_levels") or default_manual_levels()
+            budget = float(context.user_data.get("crash_budget") or 0)
+            if budget < 10:
+                budget = 50.0
+            await query.edit_message_text(
+                f"⏳ وضع أوامر السلم اليدوي على `{len(symbols)}` عملة…"
+            )
+            client = get_mexc()
+            res = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: place_crash_ladder(client, symbols, levels, budget, mode="manual"),
+            )
+            log_action(db, tid, "crash_manual_sys", f"n={len(symbols)} placed={len(res.get('placed') or [])}", True)
+            await query.edit_message_text(
+                format_crash_result(res, "اصطياد يدوي — كل المحافظ"),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{ui.I['crash']}  اصطياد الهبوط", callback_data="crash_sys")],
+                    [InlineKeyboardButton(f"{ui.I['back']}  القائمة", callback_data="menu")],
+                ]),
+            )
+        except Exception as e:
+            logger.exception("crash_run_sys")
+            await query.edit_message_text(f"❌ فشل:\n`{e}`", parse_mode="Markdown")
+        finally:
+            db.close()
+        return
+
+    if data == "crash_auto_sys" or data.startswith("crash_auto_"):
+        db = SessionLocal()
+        try:
+            pfs = get_portfolios(db, tid, status="active") or []
+            symbols = []
+            seen = set()
+            for p in pfs:
+                for c in (p.coins or []):
+                    s = (c.symbol or "").upper()
+                    if s and s not in seen:
+                        seen.add(s)
+                        symbols.append(s)
+            if not symbols:
+                await query.edit_message_text("لا عملات في المحافظ.", reply_markup=main_menu_keyboard())
+                return
+            budget = float(context.user_data.get("crash_budget") or 0)
+            if budget < 10:
+                budget = 50.0
+            await query.edit_message_text("⏳ تحليل السوق ثم وضع السلم على كل العملات…")
+            client = get_mexc()
+            levels, reason = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: analyze_market_for_auto(client),
+            )
+            mult = float(getattr(analyze_market_for_auto, "last_budget_mult", 1.0) or 1.0)
+            adj_budget = max(10.0, budget * mult)
+            res = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: place_crash_ladder(client, symbols, levels, adj_budget, mode="auto"),
+            )
+            log_action(db, tid, "crash_auto_sys", reason[:120], True)
+            text = f"📡 {reason}\n\n" + format_crash_result(res, "اصطياد تلقائي — كل المحافظ")
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{ui.I['crash']}  اصطياد الهبوط", callback_data="crash_sys")],
+                    [InlineKeyboardButton(f"{ui.I['back']}  القائمة", callback_data="menu")],
+                ]),
+            )
+        except Exception as e:
+            logger.exception("crash_auto_sys")
+            await query.edit_message_text(f"❌ فشل:\n`{e}`", parse_mode="Markdown")
+        finally:
+            db.close()
+        return
+
+    if data == "crash_cancel_sys" or data.startswith("crash_cancel_"):
+        db = SessionLocal()
+        try:
+            pfs = get_portfolios(db, tid, status="active") or []
+            symbols = []
+            seen = set()
+            for p in pfs:
+                for c in (p.coins or []):
+                    s = (c.symbol or "").upper()
+                    if s and s not in seen:
+                        seen.add(s)
+                        symbols.append(s)
+            client = get_mexc()
+            r = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: cancel_crash_orders(client, symbols),
+            )
+            await query.edit_message_text(
+                f"⏹ تم إلغاء `{r.get('cancelled', 0)}` أمر شراء معلّق.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{ui.I['crash']}  اصطياد الهبوط", callback_data="crash_sys")],
+                    [InlineKeyboardButton(f"{ui.I['back']}  القائمة", callback_data="menu")],
+                ]),
+            )
+        finally:
+            db.close()
+        return
+
+    # ========== نظام الحيتان الذكي المستقل ==========
+    if data == "smart_whale_menu":
+        running = smart_whale_control.is_running()
+        text = (
+            ui.page_title(ui.I["flow"], "Flow Engine", "تحليل مبكر لتجميع الحيتان قبل الحركة.") + "\n"
+            "يبحث عن تجميع الحيتان المبكر ويؤكده بالسعر والحجم وCVD وOrder Book قبل التداول.\n\n"
+            f"الحالة: {smart_whale_control.status_text()}\n\n"
+            "⚠️ التشغيل الحقيقي يظل منفصلًا ويتطلب مفاتيح MEXC وتأكيد المستخدم."
+        )
+        rows = []
+        if running:
+            rows.append([InlineKeyboardButton(f"{ui.I['stop']}  إيقاف النظام", callback_data="smart_whale_stop")])
+        else:
+            rows.append([InlineKeyboardButton(f"{ui.I['play']}  تشغيل النظام", callback_data="smart_whale_start_confirm")])
+        rows.append([InlineKeyboardButton(f"{ui.I['settings']}  إعدادات التداول", callback_data="smart_whale_settings")])
+        rows.append([InlineKeyboardButton("🔄 تحديث الحالة", callback_data="smart_whale_menu")])
+        rows.append([InlineKeyboardButton(f"{ui.I['back']}  القائمة", callback_data="menu")])
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data == "smart_whale_settings":
+        rt = get_whale_runtime()
+        s = rt.settings
+        rows = [
+            [InlineKeyboardButton(f"▣  حجم الصفقة: ${s.size_usdt:g}", callback_data="whale_set_size"),
+             InlineKeyboardButton(f"▤  أقصى مراكز: {s.max_positions}", callback_data="whale_set_max")],
+            [InlineKeyboardButton(f"{ui.I['flow']}  قوة الإشارة: {s.min_score:g}", callback_data="whale_set_score"),
+             InlineKeyboardButton(f"{ui.I['save']}  التأكيدات: {s.confirmations_required}", callback_data="whale_set_confirm")],
+            [InlineKeyboardButton(f"{ui.I['live']}  تأكيد Live: {s.live_confirmations_required}", callback_data="whale_set_liveconfirm"),
+             InlineKeyboardButton(f"{ui.I['target']}  الهدف: {s.take_profit_pct:g}%", callback_data="whale_set_tp")],
+            [InlineKeyboardButton(f"{ui.I['danger']}  الوقف: {s.stop_loss_pct:g}%", callback_data="whale_set_sl")],
+            [InlineKeyboardButton(f"{ui.I['clock']}  الفحص: {s.scan_interval_seconds}ث", callback_data="whale_set_interval"),
+             InlineKeyboardButton(
+                 f"▤  التعرض: {'تلقائي' if s.max_exposure_usdt <= 0 else f'${s.max_exposure_usdt:g}'}",
+                 callback_data="whale_set_exposure",
+             )],
+            [InlineKeyboardButton(f"{ui.I['refresh']}  تحديث", callback_data="smart_whale_settings"),
+             InlineKeyboardButton(f"{ui.I['back']}  Flow Engine", callback_data="whale_reco_menu")],
+        ]
+        await query.edit_message_text(
+            ui.page_title("⚙", "إعدادات الحيتان", "اضغط على أي قيمة لتعديلها.") + "\n"
+            "هذه هي الإعدادات الفعلية المستخدمة عند التشغيل.\n"
+            "اضغط على أي قيمة لتعديلها، ثم ارجع للتشغيل.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    smart_setting_prompts = {
+        "smart_set_allocated_capital": ("allocated_capital", "أرسل رأس المال المخصص بالدولار (10 إلى 1,000,000)."),
+        "smart_set_position_size": ("position_size_usdt", "أرسل حجم الصفقة الواحدة بالدولار (5 إلى 100,000)."),
+        "smart_set_max_positions": ("max_open_positions", "أرسل أقصى عدد للصفقات المفتوحة (1 إلى 50)."),
+        "smart_set_min_multiple": ("min_multiple", "أرسل قوة إشارة الحيتان، مثال: 2.5."),
+        "smart_set_stop_loss": ("stop_loss_pct", "أرسل وقف الخسارة كنسبة مئوية، مثال: 7."),
+        "smart_set_tp1": ("take_profit_1_pct", "أرسل الهدف الأول كنسبة مئوية، مثال: 8."),
+        "smart_set_tp2": ("take_profit_2_pct", "أرسل الهدف الثاني كنسبة مئوية، مثال: 15."),
+        "smart_set_interval": ("check_interval_minutes", "أرسل فاصل الفحص بالدقائق (1 إلى 1440)."),
+        "smart_set_radar_window": ("radar_window", "أرسل نافذة الرادار، مثال: 1h أو 4h أو 24h."),
+        "smart_set_min_order": ("min_order_usdt", "أرسل الحد الأدنى للأمر بالدولار (1 إلى 1000)."),
+        "smart_set_slippage": ("max_slippage_pct", "أرسل أقصى انزلاق سعري كنسبة (0.1 إلى 20)."),
+    }
+    if data in smart_setting_prompts:
+        field, prompt = smart_setting_prompts[data]
+        context.user_data["waiting"] = True
+        context.user_data["smart_whale_wait"] = {"field": field}
+        await query.edit_message_text(
+            f"⚙️ إعداد: *{smart_whale_control.FIELD_LABELS[field]}*\n\n{prompt}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{ui.I['back']}  رجوع", callback_data="whale_reco_menu")],
+            ]),
+        )
+        return
+
+    if data == "smart_whale_start_confirm":
+        await query.edit_message_text(
+            "⚠️ *تأكيد تشغيل التداول الآلي*\n\n"
+            "سيبدأ النظام بفحص إشارات الحيتان وقد ينفذ صفقات حقيقية على MEXC.\n"
+            "تأكد من إعداد مفاتيح API وحدود التداول أولًا.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{ui.I['save']}  تأكيد التشغيل", callback_data="smart_whale_start")],
+                [InlineKeyboardButton(f"{ui.I['back']}  رجوع", callback_data="whale_reco_menu")],
+            ]),
+        )
+        return
+
+    if data == "smart_whale_start":
+        ok, msg = await asyncio.get_event_loop().run_in_executor(None, smart_whale_control.start)
+        await query.edit_message_text(
+            ("✅ " if ok else "❌ ") + msg,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")],
+                [InlineKeyboardButton(f"{ui.I['back']}  القائمة", callback_data="menu")],
+            ]),
+        )
+        return
+
+    if data == "smart_whale_stop":
+        ok, msg = await asyncio.get_event_loop().run_in_executor(None, smart_whale_control.stop)
+        await query.edit_message_text(
+            ("✅ " if ok else "ℹ️ ") + msg,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")],
+                [InlineKeyboardButton(f"{ui.I['back']}  القائمة", callback_data="menu")],
+            ]),
+        )
+        return
+
+    # ========== توصيات وشراء الحيتان التلقائي ==========
+    if data == "whale_reco_menu" or data == "whale_auto_menu":
+        rt = get_whale_runtime()
+        s = rt.settings
+        text = whale_status_text(get_mexc() if rt.active else None)
+        try:
+            items = await asyncio.get_event_loop().run_in_executor(None, lambda: fetch_recommendations(5))
+            changes = {}
+            client = get_mexc()
+            for item in items:
+                try:
+                    ticker = client.exchange.fetch_ticker(f"{item['symbol']}/USDT")
+                    if ticker and ticker.get("percentage") is not None:
+                        changes[item["symbol"]] = float(ticker["percentage"])
+                except Exception:
+                    pass
+            text += "\n\n" + format_reco_message(items, changes)
+        except Exception as exc:
+            text += f"\n\n(تعذر الرادار: {exc})"
+        rows = []
+        rows.append([InlineKeyboardButton(f"{ui.I['stop']}  إيقاف", callback_data="whale_auto_stop")] if rt.active else [InlineKeyboardButton(f"{ui.I['play']}  تشغيل تلقائي", callback_data="whale_auto_start")])
+        mode_lab = "🧪 تجريبي" if s.mode == "paper" else "💰 حقيقي"
+        rows.append([InlineKeyboardButton(f"الوضع: {mode_lab}", callback_data="whale_toggle_mode")])
+        rows.append([InlineKeyboardButton(f"{ui.I['settings']}  إعدادات متقدمة", callback_data="smart_whale_settings")])
+        rows.append([InlineKeyboardButton(f"{ui.I['refresh']}  تحديث", callback_data="whale_reco_menu"), InlineKeyboardButton(f"{ui.I['back']}  القائمة", callback_data="menu")])
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data == "whale_toggle_mode":
+        rt = get_whale_runtime()
+        if rt.active:
+            await query.edit_message_text("أوقف النظام أولًا.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")]]))
+            return
+        rt.settings.mode = "live" if rt.settings.mode == "paper" else "paper"
+        save_whale_state()
+        ar = "حقيقي" if rt.settings.mode == "live" else "تجريبي"
+        await query.edit_message_text(f"الوضع: *{ar}*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")]]))
+        return
+
+    if data == "whale_auto_start":
+        rt = get_whale_runtime()
+        if rt.settings.mode == "live":
+            await query.edit_message_text("⚠️ *وضع حقيقي* — تأكيد؟\nسيشتري تلقائيًا عند توصية قوية.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{ui.I['live']}  تأكيد التداول الحقيقي", callback_data="whale_auto_start_live")], [InlineKeyboardButton(f"{ui.I['back']}  رجوع", callback_data="whale_reco_menu")]]))
+            return
+        msg = whale_auto_start(tid, rt.settings)
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{ui.I['stop']}  إيقاف", callback_data="whale_auto_stop")], [InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")]]))
+        return
+
+    if data == "whale_auto_start_live":
+        rt = get_whale_runtime()
+        rt.settings.mode = "live"
+        msg = whale_auto_start(tid, rt.settings)
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{ui.I['stop']}  إيقاف", callback_data="whale_auto_stop")], [InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")]]))
+        return
+
+    if data == "whale_auto_stop":
+        msg = whale_auto_stop(get_mexc())
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")], [InlineKeyboardButton(f"{ui.I['back']}  القائمة", callback_data="menu")]]))
+        return
+
+    if data.startswith("whale_set_"):
+        field = data[len("whale_set_"):]
+        labels = {
+            "size": "حجم الصفقة بالدولار (5 إلى 5000)",
+            "max": "أقصى مراكز مفتوحة (1 إلى 20)",
+            "score": "حد قوة الإشارة للشراء (65 إلى 95)",
+            "confirm": "عدد التأكيدات قبل الشراء الورقي (1 إلى 5)",
+            "liveconfirm": "عدد التأكيدات قبل الشراء الحقيقي (2 إلى 5)",
+            "tp": "هدف الربح % (1 إلى 100)",
+            "sl": "وقف الخسارة % (1 إلى 50)",
+            "interval": "فاصل الفحص بالثواني (15 إلى 3600)",
+            "exposure": "سقف إجمالي التعرض بالدولار (0 = تلقائي)",
+        }
+        context.user_data["waiting"] = True
+        context.user_data["edit_whale_field"] = field
+        await query.edit_message_text(f"أرسل *{labels.get(field, field)}*:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{ui.I['back']}  رجوع", callback_data="whale_reco_menu")]]))
+        return
+
     if data == "list_pf":
         db = SessionLocal()
         try:
@@ -3408,7 +4101,38 @@ async def increase_amount_msg(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
-    """مراقبة مراكز المحافظ وأوامر TP/SL الخاصة بها."""
+    """مراقبة المراكز + امتلاء أوامر اصطياد الانهيار."""
+    # اصطياد: امتلاء / هدف / وقف
+    try:
+        crash_msgs = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: monitor_crash_fills(get_mexc()),
+        )
+        admin_id = getattr(config, "ADMIN_TELEGRAM_ID", None)
+        for cm in crash_msgs or []:
+            if not admin_id:
+                break
+            try:
+                await context.bot.send_message(admin_id, cm, parse_mode="Markdown")
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("monitor_crash_fills")
+
+
+    try:
+        whale_msgs = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: whale_auto_tick(get_mexc()),
+        )
+        admin_id = getattr(config, "ADMIN_TELEGRAM_ID", None)
+        for wm in whale_msgs or []:
+            if not admin_id:
+                break
+            try:
+                await context.bot.send_message(admin_id, wm, parse_mode="Markdown")
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("whale_auto_tick")
 
     db = SessionLocal()
     try:
@@ -3830,6 +4554,18 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 
+async def order_book_sniper_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        tid = int(getattr(config, "ADMIN_TELEGRAM_ID", 0) or 0)
+        if not tid:
+            return
+        sniper = get_sniper(tid)
+        if sniper.enabled:
+            await asyncio.to_thread(sniper.scan_once)
+    except Exception:
+        logger.exception("Order Book Sniper scan failed")
+
+
 def main():
     if not config.TELEGRAM_BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN مطلوب")
@@ -3841,6 +4577,8 @@ def main():
     init_db()
     # Strategy tables are isolated and do not modify portfolio records/models.
     init_liquidity_db()
+    if config.ADMIN_TELEGRAM_ID:
+        _load_whale_settings(config.ADMIN_TELEGRAM_ID)
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
     app.bot_data["get_mexc"] = get_mexc
 
@@ -3854,6 +4592,13 @@ def main():
             name="liquidity_swings_spot_scan",
         )
         logger.info("Liquidity Swings Spot strategy scheduled (every 60s)")
+
+    if app.job_queue:
+        app.job_queue.run_repeating(
+            order_book_sniper_job, interval=2, first=5,
+            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 5},
+            name="order_book_liquidity_sniper",
+        )
 
     # Cloud monitor for TP/SL every 25 seconds
     if app.job_queue:

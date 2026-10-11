@@ -6,11 +6,12 @@ load_dotenv()
 # MEXC (مطلوب)
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
+COINLOBSTER_API_KEY = os.getenv("COINLOBSTER_API_KEY", "")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-# رقم الأدمن الوحيد المسموح له باستخدام البوت
+# رقم الأدمن فقط يقدر يستخدم البوت (مستحسن جداً)
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0") or "0")
 
 DEFAULT_THRESHOLD = 2.0

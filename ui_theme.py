@@ -18,6 +18,7 @@ I = {
     "balance": "◍",
     "settings": "⚙",
     "cleanup": "⌫",
+    "crash": "↘",
     "play": "▶",
     "stop": "■",
     "refresh": "⟳",
