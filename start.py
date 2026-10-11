@@ -7,6 +7,7 @@ REQUIRED_ENV_VARS = (
     "MEXC_API_KEY",
     "MEXC_API_SECRET",
     "DATABASE_URL",
+    "ADMIN_TELEGRAM_ID",
 )
 
 missing = [name for name in REQUIRED_ENV_VARS if not os.getenv(name)]

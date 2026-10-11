@@ -10,7 +10,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-# رقم الأدمن فقط يقدر يستخدم البوت (مستحسن جداً)
+# رقم الأدمن الوحيد المسموح له باستخدام البوت
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0") or "0")
 
 DEFAULT_THRESHOLD = 2.0

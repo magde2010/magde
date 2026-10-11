@@ -150,9 +150,7 @@ def get_reb() -> Rebalancer:
 
 
 def is_admin(user_id: int) -> bool:
-    if not config.ADMIN_TELEGRAM_ID:
-        return True
-    return user_id == config.ADMIN_TELEGRAM_ID
+    return bool(config.ADMIN_TELEGRAM_ID) and user_id == config.ADMIN_TELEGRAM_ID
 
 
 async def ensure_admin(update: Update) -> bool:
