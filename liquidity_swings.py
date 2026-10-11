@@ -38,7 +38,7 @@ _OHLCV_CACHE_LOCK = threading.Lock()
 _TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
 _DB_READY_ENGINE = None
 
-SCAN_ENGINE_VERSION = 2
+SCAN_ENGINE_VERSION = 3
 DEFAULT_SCAN_BATCH = 60
 MAX_SCAN_BATCH = 200
 # Concurrent public OHLCV requests. MEXC allows far more; this stays well within
@@ -93,7 +93,7 @@ class LiquiditySettings(LiquidityBase):
     min_rr = Column(Float, nullable=False, default=2.0)
     stop_buffer_pct = Column(Float, nullable=False, default=0.2)
     max_entry_deviation_pct = Column(Float, nullable=False, default=0.5)
-    min_daily_quote_volume = Column(Float, nullable=False, default=1_000_000.0)
+    min_daily_quote_volume = Column(Float, nullable=False, default=300_000.0)
     max_spread_pct = Column(Float, nullable=False, default=0.5)
     discovered_symbols_json = Column(Text, nullable=False, default="[]")
     last_discovery_at = Column(DateTime, nullable=True)
@@ -238,6 +238,11 @@ def init_liquidity_db() -> None:
             conn.execute(text(
                 "UPDATE liquidity_strategy_settings SET max_symbols = :batch WHERE max_symbols = 10 AND scan_engine_version < :version"
             ), {"batch": DEFAULT_SCAN_BATCH, "version": SCAN_ENGINE_VERSION})
+            # Lower the old 1M USDT volume default once; custom user values are kept.
+            conn.execute(text(
+                "UPDATE liquidity_strategy_settings SET min_daily_quote_volume = 300000 "
+                "WHERE min_daily_quote_volume = 1000000 AND scan_engine_version < 3"
+            ))
             conn.execute(text(
                 "UPDATE liquidity_strategy_settings SET scan_engine_version = :version WHERE scan_engine_version < :version"
             ), {"version": SCAN_ENGINE_VERSION})
@@ -399,9 +404,10 @@ def diagnose_long_setup(
     if profile == "conservative":
         trend_ok = last4 > sma20 and sma20 > sma50
     elif profile == "active":
-        trend_ok = last4 > sma50 * 0.985 and sma20 >= sma50 * 0.985
+        # Only reject a clear 4H downtrend: price well under SMA50 and SMA20 falling below it.
+        trend_ok = last4 > sma50 * 0.95 and sma20 >= sma50 * 0.95
     else:
-        trend_ok = last4 > sma50 and sma20 >= sma50 * 0.995
+        trend_ok = last4 > sma50 * 0.97 and sma20 >= sma50 * 0.97
     if not trend_ok:
         return None, "trend_not_bullish", f"شرط اتجاه 4H غير متحقق (المستوى: {profile})"
 
@@ -416,17 +422,22 @@ def diagnose_long_setup(
     if len(candles_15m) < 25:
         return insufficient
     # A sweep is a 15m event; its 5m confirmation often arrives in the next
-    # candle(s). Keep the last four CLOSED 15m candles in the search window.
+    # candle(s). Search the last eight CLOSED 15m candles (2 hours) against the
+    # three most recent confirmed 1H lows, newest zone first.
     fifteen_minutes_ms = 15 * 60 * 1000
     confirmation_window_ms = 30 * 60 * 1000
-    sweep_lookback = min(4, len(candles_15m))
+    sweep_lookback = min(8, len(candles_15m))
     recent_sweeps = []
-    for idx in range(len(candles_15m) - 1, len(candles_15m) - sweep_lookback - 1, -1):
-        row = candles_15m[idx]
-        row_low = _safe_float(row[3])
-        row_close = _safe_float(row[4])
-        if row_low < zone_low and row_close > zone_low:
-            recent_sweeps.append((idx, row, row_low, _safe_float(row[0])))
+    for candidate_zone_index, candidate_zone_low in reversed(lows1[-3:]):
+        for idx in range(len(candles_15m) - 1, len(candles_15m) - sweep_lookback - 1, -1):
+            row = candles_15m[idx]
+            row_low = _safe_float(row[3])
+            row_close = _safe_float(row[4])
+            if row_low < candidate_zone_low and row_close > candidate_zone_low:
+                recent_sweeps.append((idx, row, row_low, _safe_float(row[0])))
+        if recent_sweeps:
+            zone_index, zone_low = candidate_zone_index, candidate_zone_low
+            break
     if not recent_sweeps:
         return None, "waiting_sweep", (
             f"لا يوجد sweep/reclaim على آخر {sweep_lookback} شموع مغلقة 15m؛ "
@@ -1260,7 +1271,7 @@ def _scan_once_impl(client, telegram_id: int, monitor: Dict[str, Any]) -> List[D
             signal_key = f"{symbol}:{int(signal['signal_ts'])}"
             if last_signals.get(symbol) == int(signal["signal_ts"]) or _is_duplicate(db, telegram_id, settings.mode, signal_key):
                 _upsert_symbol_scan(db, telegram_id, symbol, "duplicate_signal",
-                                    "تمت معالجة إشارة هذه الشمعة من قبل؛ لن يتم تكرار الدخول",
+                                    "تمت مع��لجة إشارة هذه الشمعة من قبل؛ لن يتم تكرار الدخول",
                                     price=current_price, candles={"4h": candles_4h, "1h": candles_1h,
                                                                   "15m": candles_15m, "5m": candles_5m}, signal_found=True)
                 continue
