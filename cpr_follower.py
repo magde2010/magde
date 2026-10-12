@@ -171,11 +171,13 @@ def stop_cpr(client=None, reason: str = "manual") -> str:
     if rt.settings.mode == "live" and client and rt.positions:
         for sym, pos in list(rt.positions.items()):
             try:
-                client.create_market_order(f"{sym}/USDT", "sell", pos.amount * 0.998)
+                order = client.create_market_order(f"{sym}/USDT", "sell", pos.amount * 0.998)
+                if not order:
+                    raise RuntimeError("MEXC لم يؤكد أمر البيع")
                 notes.append(sym)
+                rt.positions.pop(sym, None)
             except Exception as e:
                 log_cpr("force_sell_fail", symbol=sym, error=str(e)[:80])
-        rt.positions.clear()
     elif rt.positions:
         # ورق: أقفل بسعر السوق للملخص
         if client:
@@ -345,7 +347,9 @@ def _close(client, symbol: str, px: float, reason: str) -> Optional[str]:
         em = "🟢" if pnl >= 0 else "🔴"
         return f"{em} *CPR بيع (تجريبي)* `{symbol}` @{px:.6g}\nPnL `{pnl:+.2f}$` — {reason}"
     try:
-        client.create_market_order(f"{symbol}/USDT", "sell", pos.amount * 0.998)
+        order = client.create_market_order(f"{symbol}/USDT", "sell", pos.amount * 0.998)
+        if not order:
+            raise RuntimeError("MEXC لم يؤكد أمر البيع")
         rt.closed.append(ClosedTrade(
             symbol=symbol, entry=pos.entry, exit=px, amount=pos.amount,
             pnl=pnl, reason=reason, opened_at=pos.opened_at,

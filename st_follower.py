@@ -146,12 +146,14 @@ def stop_follower(client=None, reason: str = "manual") -> str:
     if client and rt.positions:
         for sym, pos in list(rt.positions.items()):
             try:
-                client.create_market_order(f"{sym}/USDT", "sell", pos.amount * 0.998)
+                order = client.create_market_order(f"{sym}/USDT", "sell", pos.amount * 0.998)
+                if not order:
+                    raise RuntimeError("MEXC لم يؤكد أمر البيع")
                 notes.append(sym)
                 log_st("force_sell", symbol=sym, reason=reason)
+                rt.positions.pop(sym, None)
             except Exception as e:
                 log_st("force_sell_fail", symbol=sym, error=str(e)[:100])
-        rt.positions.clear()
     rt.active = False
     rt.manual_watch.clear()
     log_st("stop", reason=reason)
@@ -236,7 +238,9 @@ def _sell(client, symbol: str, reason: str) -> Optional[str]:
         return None
     try:
         px = float(client.get_ticker_price(f"{symbol}/USDT") or pos.entry)
-        client.create_market_order(f"{symbol}/USDT", "sell", pos.amount * 0.998)
+        order = client.create_market_order(f"{symbol}/USDT", "sell", pos.amount * 0.998)
+        if not order:
+            raise RuntimeError("MEXC لم يؤكد أمر البيع")
         pnl = (px - pos.entry) * pos.amount
         del rt.positions[symbol]
         log_st("exit", symbol=symbol, price=px, pnl=pnl, reason=reason)

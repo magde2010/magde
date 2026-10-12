@@ -39,6 +39,34 @@ class Rebalancer:
     def __init__(self, client: MexcClient):
         self.client = client
         self.quote = client.quote
+        # A single empty/partial exchange response must never close a position.
+        self._balance_zero_streak = {}
+
+    def _confirmed_total_amount(self, symbol: str):
+        """Return total wallet amount, or None when the balance read is unreliable."""
+        exchange = getattr(self.client, "exchange", None)
+        if exchange is not None and hasattr(exchange, "fetch_balance"):
+            try:
+                raw = exchange.fetch_balance()
+                if not isinstance(raw, dict) or not ("total" in raw or "free" in raw):
+                    return None
+                key = self.client.normalize_asset_symbol(symbol)
+                total = raw.get("total") or {}
+                free = raw.get("free") or {}
+                return max(
+                    float(total.get(key) or total.get(symbol) or 0),
+                    float(free.get(key) or free.get(symbol) or 0),
+                )
+            except Exception as exc:
+                logger.warning("Balance read failed for %s; preserving position: %s", symbol, exc)
+                return None
+        try:
+            return max(
+                float(self.client.get_total_amount(symbol) or 0),
+                float(self.client.get_free_amount(symbol) or 0),
+            )
+        except Exception:
+            return None
 
     def fetch_candles(self, symbol: str, timeframe: str = "1h", limit: int = 80) -> List:
         pair = f"{symbol}/{self.quote}"
@@ -446,23 +474,24 @@ class Rebalancer:
             remaining = float(coin.remaining_amount or coin.amount or 0)
             sl = float(coin.current_sl_price or 0)
 
-            # ----- رصيد فعلي (الإجمالي وليس الحر فقط) -----
-            # في الوضع اليدوي الرصيد غالبًا مقفول في أوامر Limit → free=0 بالغلط
-            try:
-                free_amt = float(self.client.get_free_amount(symbol) or 0)
-            except Exception:
-                free_amt = 0.0
-            try:
-                total_amt = float(self.client.get_total_amount(symbol) or 0)
-            except Exception:
-                total_amt = free_amt or remaining
-
-            # استخدم الأكبر بين المتاح والإجمالي لتجنب إغلاق وهمي
-            effective_amt = max(free_amt, total_amt, 0.0)
+            # ----- رصيد مؤكد (الإجمالي وليس الحر فقط) -----
+            # لا نغلق/نحذف المركز عند فشل API أو رد فارغ. وحتى الرد الصفري
+            # الصحيح يحتاج 3 دورات مراقبة متتالية قبل المزامنة.
+            effective_amt = self._confirmed_total_amount(symbol)
+            if effective_amt is None:
+                self._balance_zero_streak.pop(symbol, None)
+                continue
             market_val = effective_amt * price
             if status != "waiting_reentry":
-                # إغلاق فقط لو مفيش رصيد حقيقي على المنصة
                 if effective_amt <= 0 or market_val < MIN_POSITION_USDT:
+                    streak = self._balance_zero_streak.get(symbol, 0) + 1
+                    self._balance_zero_streak[symbol] = streak
+                    if streak < 3:
+                        logger.warning(
+                            "Preserving %s: confirmed low balance read %s/3 (amount=%.8g, value=%.6g)",
+                            symbol, streak, effective_amt, market_val,
+                        )
+                        continue
                     # لو القاعدة أصلًا فاضية → صامت (تزامن بدون إشعار)
                     silent = remaining <= 0
                     actions.append({
@@ -476,6 +505,7 @@ class Rebalancer:
                         "silent": silent,
                     })
                     continue
+                self._balance_zero_streak.pop(symbol, None)
 
             # ----- إعادة دخول متكررة (سلسة) -----
             if status == "waiting_reentry":

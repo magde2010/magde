@@ -270,13 +270,15 @@ def stop_sniper(client=None, reason: str = "manual") -> str:
     if client and rt.positions:
         for sym, pos in list(rt.positions.items()):
             try:
-                client.create_market_order(f"{sym}/USDT", "sell", pos.amount * 0.998)
+                order = client.create_market_order(f"{sym}/USDT", "sell", pos.amount * 0.998)
+                if not order:
+                    raise RuntimeError("MEXC لم يؤكد أمر البيع")
                 notes.append(f"{sym} بيع")
                 log_sniper("force_sell", symbol=sym, reason=reason)
+                rt.positions.pop(sym, None)
             except Exception as e:
                 notes.append(f"{sym} فشل: {e}")
                 log_sniper("force_sell_fail", symbol=sym, error=str(e)[:100])
-        rt.positions.clear()
     rt.active = False
     rt.status_message = f"متوقف ({reason})"
     log_sniper("stop", reason=reason, realized=rt.session_realized)
@@ -330,10 +332,10 @@ def tick(client) -> List[Dict[str, Any]]:
         if px <= pos.sl:
             pnl = (px - pos.entry) * pos.amount
             try:
-                client.create_market_order(f"{sym}/USDT", "sell", pos.amount * 0.998)
-                sold = True
+                order = client.create_market_order(f"{sym}/USDT", "sell", pos.amount * 0.998)
+                if not order:
+                    raise RuntimeError("MEXC لم يؤكد أمر البيع")
             except Exception as e:
-                sold = False
                 log_sniper("sl_sell_fail", symbol=sym, error=str(e)[:120])
                 msgs.append({"text": f"❌ سنايبر: فشل بيع `{sym}` عند الاستوب\n`{e}`"})
                 continue
@@ -358,12 +360,14 @@ def tick(client) -> List[Dict[str, Any]]:
         for sym, pos in list(rt.positions.items()):
             try:
                 px = float(client.get_ticker_price(f"{sym}/USDT") or pos.entry)
-                client.create_market_order(f"{sym}/USDT", "sell", pos.amount * 0.998)
+                order = client.create_market_order(f"{sym}/USDT", "sell", pos.amount * 0.998)
+                if not order:
+                    raise RuntimeError("MEXC لم يؤكد أمر البيع")
                 pnl = (px - pos.entry) * pos.amount
                 rt.session_realized += pnl
+                rt.positions.pop(sym, None)
             except Exception as e:
                 log_sniper("target_close_fail", symbol=sym, error=str(e)[:100])
-            del rt.positions[sym]
         log_sniper("session_target", pnl=rt.session_realized, session=rt.session_index)
         msgs.append({
             "text": (
@@ -378,13 +382,14 @@ def tick(client) -> List[Dict[str, Any]]:
         for sym, pos in list(rt.positions.items()):
             try:
                 px = float(client.get_ticker_price(f"{sym}/USDT") or pos.entry)
-                client.create_market_order(f"{sym}/USDT", "sell", pos.amount * 0.998)
+                order = client.create_market_order(f"{sym}/USDT", "sell", pos.amount * 0.998)
+                if not order:
+                    raise RuntimeError("MEXC لم يؤكد أمر البيع")
                 pnl = (px - pos.entry) * pos.amount
                 rt.session_realized += pnl
+                rt.positions.pop(sym, None)
             except Exception as e:
                 log_sniper("stop_close_fail", symbol=sym, error=str(e)[:100])
-            if sym in rt.positions:
-                del rt.positions[sym]
         log_sniper("session_stop_loss", pnl=rt.session_realized, session=rt.session_index)
         msgs.append({
             "text": (
