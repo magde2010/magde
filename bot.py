@@ -36,10 +36,51 @@ from rebalancer import Rebalancer
 import ui_theme as ui
 from portfolio_controls import calculate_portfolio_entry_budget, calculate_safe_trim_amount, calculate_outstanding_trim_amounts
 
+
+def _redact_secrets(value: str) -> str:
+    """Redact credentials from log messages and tracebacks."""
+    import re
+
+    text = str(value)
+    for secret in (
+        config.TELEGRAM_BOT_TOKEN,
+        config.MEXC_API_KEY,
+        config.MEXC_API_SECRET,
+        config.DATABASE_URL,
+    ):
+        if secret and len(secret) >= 4:
+            text = text.replace(secret, "[REDACTED]")
+    text = re.sub(
+        r"(https?://api\.telegram\.org/bot)[^/\s]+",
+        r"\1[REDACTED]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(\b(?:token|api[_-]?key|api[_-]?secret|password|passwd)=)[^&\s]+",
+        r"\1[REDACTED]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"(\bbot\d+):[A-Za-z0-9_-]+", r"\1:[REDACTED]", text)
+
+
+class _SecretRedactingFormatter(logging.Formatter):
+    def format(self, record):
+        return _redact_secrets(super().format(record))
+
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# The Telegram URL logged by httpx contains the bot token. Redact every
+# handler's final output and suppress routine request URLs at INFO level.
+for _handler in logging.getLogger().handlers:
+    _formatter = _handler.formatter
+    _format = getattr(getattr(_formatter, "_style", None), "_fmt", None) or "%(message)s"
+    _handler.setFormatter(_SecretRedactingFormatter(_format, datefmt=getattr(_formatter, "datefmt", None)))
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 (
