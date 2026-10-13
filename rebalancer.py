@@ -1,6 +1,7 @@
 from typing import Dict, List, Optional, Any
 from mexc_client import MexcClient
 import logging
+import time
 logger = logging.getLogger(__name__)
 
 
@@ -67,6 +68,34 @@ class Rebalancer:
             )
         except Exception:
             return None
+
+    def _confirm_market_sell(self, symbol: str, order: Dict[str, Any], requested: float) -> float:
+        """Return filled quantity; reject unconfirmed or partial stop-loss sells."""
+        checked = order or {}
+        order_id = str(checked.get("id") or "")
+        for _ in range(3):
+            try:
+                filled = float(checked.get("filled") or 0)
+            except (TypeError, ValueError):
+                filled = 0.0
+            if filled > 0:
+                break
+            if not order_id or not hasattr(self.client, "fetch_order"):
+                break
+            time.sleep(0.4)
+            checked = self.client.fetch_order(order_id, symbol) or checked
+        try:
+            filled = float(checked.get("filled") or 0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        tolerance = max(float(requested) * 1e-6, 1e-12)
+        if filled <= 0:
+            raise RuntimeError(f"لم تؤكد MEXC تنفيذ بيع وقف الخسارة (order={order_id or 'بدون رقم'})")
+        if filled + tolerance < float(requested):
+            raise RuntimeError(
+                f"تم تنفيذ بيع جزئي فقط عند الاستوب: {filled:.8g}/{float(requested):.8g}"
+            )
+        return min(filled, float(requested))
 
     def fetch_candles(self, symbol: str, timeframe: str = "1h", limit: int = 80) -> List:
         pair = f"{symbol}/{self.quote}"
@@ -597,6 +626,9 @@ class Rebalancer:
                         )
                         if not order:
                             raise RuntimeError("Exchange did not return a market sell order.")
+                        self._confirm_market_sell(
+                            f"{symbol}/{self.quote}", order, amount
+                        )
                         sold = True
                     except Exception as exc:
                         actions.append({

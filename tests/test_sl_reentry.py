@@ -84,6 +84,18 @@ class StopLossReentryTests(unittest.TestCase):
 
         self.assertEqual(actions[0]["action"], "sl_sell_failed")
 
+    def test_unfilled_market_order_does_not_enable_reentry(self):
+        client = FakeClient({"id": "sell-open", "status": "open", "filled": 0.0})
+        actions = Rebalancer(client).check_and_manage_positions([make_position()])
+
+        self.assertEqual(actions[0]["action"], "sl_sell_failed")
+
+    def test_partial_market_order_does_not_enable_reentry(self):
+        client = FakeClient({"id": "sell-partial", "status": "closed", "filled": 2.0})
+        actions = Rebalancer(client).check_and_manage_positions([make_position()])
+
+        self.assertEqual(actions[0]["action"], "sl_sell_failed")
+
     def test_cancellation_error_prevents_market_sell(self):
         client = FakeClient(
             {"id": "sell-1", "status": "closed", "filled": 4.99},
