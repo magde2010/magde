@@ -130,29 +130,6 @@ class PortfolioTrade(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-class CrashOrder(Base):
-    """Persistent tracking for crash-hunter limit buys.
-
-    Crash Hunter is account-wide in this bot, so these records intentionally do
-    not belong to a virtual portfolio. Persistence prevents a process restart
-    from forgetting live MEXC orders.
-    """
-    __tablename__ = "crash_orders"
-
-    id = Column(Integer, primary_key=True, index=True)
-    symbol = Column(String(20), nullable=False, index=True)
-    order_id = Column(String(64), unique=True, nullable=False, index=True)
-    limit_price = Column(Float, default=0.0)
-    usdt = Column(Float, default=0.0)
-    pct = Column(Float, default=0.0)
-    placed_at = Column(Float, default=0.0)
-    status = Column(String(20), default="open", index=True)
-    fill_price = Column(Float, default=0.0)
-    amount = Column(Float, default=0.0)
-    tp_order_id = Column(String(64), nullable=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-
 class RebalanceLog(Base):
     __tablename__ = "rebalance_logs"
 
@@ -165,122 +142,6 @@ class RebalanceLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-
-
-class SniperConfig(Base):
-    """إعدادات نظام الاقتناص (سنايبر) — منفصلة عن المحافظ."""
-    __tablename__ = "sniper_config"
-
-    id = Column(Integer, primary_key=True, index=True)
-    telegram_id = Column(BigInteger, unique=True, index=True, nullable=False)
-    target_usdt = Column(Float, default=5.0)
-    stop_usdt = Column(Float, default=5.0)
-    min_size_usdt = Column(Float, default=30.0)
-    max_size_usdt = Column(Float, default=80.0)
-    max_positions = Column(Integer, default=1)
-    sessions_planned = Column(Integer, default=3)
-    trail_pct = Column(Float, default=2.0)
-    initial_sl_pct = Column(Float, default=2.0)
-    continue_after_loss = Column(Boolean, default=False)
-    watchlist = Column(Text, default="")
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-
-def get_sniper_config(db, telegram_id: int):
-    row = db.query(SniperConfig).filter(SniperConfig.telegram_id == telegram_id).first()
-    if not row:
-        row = SniperConfig(telegram_id=telegram_id)
-        db.add(row)
-        db.commit()
-        db.refresh(row)
-    return row
-
-
-def update_sniper_config(db, telegram_id: int, **kwargs):
-    row = get_sniper_config(db, telegram_id)
-    for k, v in kwargs.items():
-        if hasattr(row, k) and v is not None:
-            setattr(row, k, v)
-    db.commit()
-    db.refresh(row)
-    return row
-
-
-
-
-class STConfig(Base):
-    """إعدادات متابع SuperTrend."""
-    __tablename__ = "st_config"
-
-    id = Column(Integer, primary_key=True, index=True)
-    telegram_id = Column(BigInteger, unique=True, index=True, nullable=False)
-    timeframe = Column(String(10), default="15m")
-    atr_period = Column(Integer, default=10)
-    multiplier = Column(Float, default=3.0)
-    size_usdt = Column(Float, default=50.0)
-    max_positions = Column(Integer, default=2)
-    auto_enabled = Column(Boolean, default=False)
-    confirm_before_entry = Column(Boolean, default=False)
-    watchlist = Column(Text, default="")
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-
-def get_st_config(db, telegram_id: int):
-    row = db.query(STConfig).filter(STConfig.telegram_id == telegram_id).first()
-    if not row:
-        row = STConfig(telegram_id=telegram_id)
-        db.add(row)
-        db.commit()
-        db.refresh(row)
-    return row
-
-
-def update_st_config(db, telegram_id: int, **kwargs):
-    row = get_st_config(db, telegram_id)
-    for k, v in kwargs.items():
-        if hasattr(row, k) and v is not None:
-            setattr(row, k, v)
-    db.commit()
-    db.refresh(row)
-    return row
-
-
-
-
-class CPRConfig(Base):
-    """إعدادات متابع CPR — تجريبي أو حقيقي."""
-    __tablename__ = "cpr_config"
-
-    id = Column(Integer, primary_key=True, index=True)
-    telegram_id = Column(BigInteger, unique=True, index=True, nullable=False)
-    mode = Column(String(10), default="paper")  # paper | live
-    investment_usdt = Column(Float, default=100.0)
-    size_usdt = Column(Float, default=15.0)
-    max_positions = Column(Integer, default=3)
-    coins = Column(Text, default="")
-    take_r1 = Column(Boolean, default=True)
-    exit_on_bc = Column(Boolean, default=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-
-def get_cpr_config(db, telegram_id: int):
-    row = db.query(CPRConfig).filter(CPRConfig.telegram_id == telegram_id).first()
-    if not row:
-        row = CPRConfig(telegram_id=telegram_id)
-        db.add(row)
-        db.commit()
-        db.refresh(row)
-    return row
-
-
-def update_cpr_config(db, telegram_id: int, **kwargs):
-    row = get_cpr_config(db, telegram_id)
-    for k, v in kwargs.items():
-        if hasattr(row, k) and v is not None:
-            setattr(row, k, v)
-    db.commit()
-    db.refresh(row)
-    return row
 
 
 def init_db():
@@ -790,38 +651,6 @@ def get_open_positions(db, telegram_id: int = None):
     if telegram_id:
         q = q.filter(Portfolio.telegram_id == telegram_id)
     return q.all()
-
-
-def upsert_crash_order(db, **kwargs):
-    """Persist one crash-hunter order by exchange order id."""
-    order_id = str(kwargs.get("order_id") or "")
-    if not order_id:
-        return None
-    row = db.query(CrashOrder).filter(CrashOrder.order_id == order_id).first()
-    if not row:
-        row = CrashOrder(order_id=order_id)
-        db.add(row)
-    for key, value in kwargs.items():
-        if key != "order_id" and hasattr(row, key) and value is not None:
-            setattr(row, key, value)
-    db.commit()
-    db.refresh(row)
-    return row
-
-
-def get_active_crash_orders(db):
-    return db.query(CrashOrder).filter(CrashOrder.status.in_(["open", "filled"])).all()
-
-
-def update_crash_order(db, order_id: str, **kwargs):
-    row = db.query(CrashOrder).filter(CrashOrder.order_id == str(order_id)).first()
-    if not row:
-        return None
-    for key, value in kwargs.items():
-        if hasattr(row, key) and value is not None:
-            setattr(row, key, value)
-    db.commit()
-    return row
 
 
 def log_action(db, telegram_id: int, action: str, details: str, success: bool = True, portfolio_id: int = None):

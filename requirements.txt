@@ -5,4 +5,3 @@ python-dotenv==1.0.1
 python-telegram-bot[job-queue]==21.10
 requests==2.32.3
 apscheduler==3.10.4
-websocket-client==1.9.0
