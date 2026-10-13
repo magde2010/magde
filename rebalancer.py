@@ -578,10 +578,20 @@ class Rebalancer:
                     tracked_amount = max(0.0, float(coin.amount or 0))
 
                 try:
-                    cancel_result = self.client.cancel_all_open_sells(symbol) or {}
-                    cancel_errors = cancel_result.get("errors") or []
-                    if cancel_errors:
-                        raise RuntimeError(f"TP/order cancellation failed: {cancel_errors}")
+                    # Cancel only TP orders belonging to this tracked position.
+                    # Never cancel another portfolio's sell order for the same symbol.
+                    for key in ("tp_order_id", "tp1_order_id", "tp2_order_id", "tp3_order_id"):
+                        order_id = getattr(coin, key, None)
+                        if order_id:
+                            self.client.cancel_order(
+                                str(order_id), f"{symbol}/{self.quote}", strict=False
+                            )
+                    remaining_sells = self.client.fetch_open_sell_orders(symbol)
+                    if remaining_sells:
+                        ids = [str(order.get("id") or "?") for order in remaining_sells[:5]]
+                        raise RuntimeError(
+                            f"Open sell orders remain after TP cancellation: {', '.join(ids)}"
+                        )
                     import time as _time
                     _time.sleep(0.8)
                     free_after_cancel = float(self.client.get_free_amount(symbol) or 0.0)
