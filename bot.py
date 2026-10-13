@@ -3825,15 +3825,19 @@ def main():
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
     app.bot_data["get_mexc"] = get_mexc
 
-    # Cloud monitor for TP/SL every 25 seconds
+    # Fast cloud monitor for TP/SL; one complete market sell is safer than
+    # sequential chunks because it minimizes time exposed during a fast drop.
     if app.job_queue:
         app.job_queue.run_repeating(
             monitor_positions_job,
-            interval=60,
+            interval=config.STOP_MONITOR_INTERVAL_SECONDS,
             first=15,
             job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 30},
         )
-        logger.info("Position monitor job scheduled (every 45s)")
+        logger.info(
+            "Position monitor job scheduled (every %.1fs)",
+            config.STOP_MONITOR_INTERVAL_SECONDS,
+        )
     else:
         logger.warning("JobQueue not available — install python-telegram-bot[job-queue]")
 
