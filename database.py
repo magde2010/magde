@@ -1,11 +1,65 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, BigInteger, ForeignKey, Text, update
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, BigInteger, ForeignKey, Text, update, text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime
+import atexit
+import os
+import tempfile
 import config
 
 engine = create_engine(config.DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+_singleton_connection = None
+_singleton_file = None
+
+
+def acquire_singleton_lock() -> bool:
+    """Allow only one running Telegram poller for this deployment/database."""
+    global _singleton_connection, _singleton_file
+    if _singleton_connection is not None or _singleton_file is not None:
+        return True
+
+    if engine.dialect.name == "postgresql":
+        connection = engine.connect()
+        acquired = connection.execute(
+            text("SELECT pg_try_advisory_lock(hashtext(:lock_key))"),
+            {"lock_key": "lotfe.telegram.polling"},
+        ).scalar()
+        if not acquired:
+            connection.close()
+            return False
+        _singleton_connection = connection
+        atexit.register(release_singleton_lock)
+        return True
+
+    # SQLite/local fallback: an OS lock prevents duplicate local processes.
+    import fcntl
+
+    lock_path = os.path.join(tempfile.gettempdir(), "lotfe-telegram-polling.lock")
+    lock_file = open(lock_path, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return False
+    _singleton_file = lock_file
+    atexit.register(release_singleton_lock)
+    return True
+
+
+def release_singleton_lock() -> None:
+    """Release the singleton lock when the process exits."""
+    global _singleton_connection, _singleton_file
+    if _singleton_connection is not None:
+        _singleton_connection.close()
+        _singleton_connection = None
+    if _singleton_file is not None:
+        import fcntl
+
+        fcntl.flock(_singleton_file.fileno(), fcntl.LOCK_UN)
+        _singleton_file.close()
+        _singleton_file = None
 
 
 class UserSettings(Base):

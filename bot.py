@@ -29,7 +29,7 @@ from database import (
     update_coin_position, reset_coin_positions, get_open_positions,
     record_trade_event, get_trade_event,
     get_portfolio_trade_events, mark_reentry_events_used,
-    reset_portfolio_cycle_state,
+    reset_portfolio_cycle_state, acquire_singleton_lock,
 )
 from mexc_client import MexcClient
 from rebalancer import Rebalancer
@@ -3815,6 +3815,11 @@ def main():
         raise SystemExit("MEXC_API_KEY و MEXC_API_SECRET مطلوبان")
     if not config.DATABASE_URL:
         raise SystemExit("DATABASE_URL مطلوب")
+
+    if not acquire_singleton_lock():
+        raise SystemExit(
+            "نسخة أخرى من البوت تعمل بالفعل؛ تم إيقاف هذه النسخة لمنع Telegram 409 Conflict."
+        )
 
     init_db()
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
