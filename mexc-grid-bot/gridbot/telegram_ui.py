@@ -4,7 +4,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from .config import config_from_env
 
 def allowed(update):
-    raw=os.getenv('TELEGRAM_ALLOWED_USER_IDS','').strip()
+    raw=os.getenv('TELEGRAM_ALLOWED_USER_IDS','').strip() or os.getenv('ADMIN_TELEGRAM_ID','').strip()
     if not raw or update.effective_user is None: return False
     try: return update.effective_user.id in {int(x.strip()) for x in raw.split(',') if x.strip()}
     except ValueError: return False
