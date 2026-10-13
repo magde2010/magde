@@ -1,1 +1,1 @@
-worker: cd mexc-grid-bot && python -m gridbot
+worker: python start.py

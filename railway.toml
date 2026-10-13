@@ -1,4 +1,4 @@
 [deploy]
-startCommand = "cd mexc-grid-bot && python -m gridbot"
+startCommand = "python start.py"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
