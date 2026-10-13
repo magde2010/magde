@@ -271,8 +271,21 @@ class MexcClient:
                 return None
             raise Exception(f"Order failed: {str(e)}")
 
+    # Markers meaning "this exchange/pair rejects the `cost` parameter".
+    # Any other failure (timeout, network, 5xx) is genuinely unknown: the order
+    # may already be live, so retrying could open a second position.
+    _COST_PARAM_MARKERS = (
+        "unsupported", "not support", "cost parameter", "invalid parameter",
+        "parameter cost", "unknown parameter", "invalid param",
+    )
+
     def create_market_buy_usdt(self, symbol: str, usdt_amount: float) -> Optional[dict]:
-        """Buy using quote amount (USDT). Tries create_order with cost, falls back to amount calculation."""
+        """Buy using a quote amount (USDT).
+
+        Tries the cost-based market order first. It only falls back to an
+        amount-based order when the exchange explicitly rejects the `cost`
+        parameter; ambiguous failures are re-raised without a second order.
+        """
         pair = f"{symbol}/{self.quote}"
         try:
             # Prefer cost-based if supported
@@ -284,8 +297,11 @@ class MexcClient:
                 params={'cost': usdt_amount}
             )
             return order
-        except Exception:
-            # Fallback: calculate amount from price
+        except Exception as exc:
+            message = str(exc).lower()
+            if not any(marker in message for marker in self._COST_PARAM_MARKERS):
+                raise Exception(f"Market buy failed for {pair}: {exc}")
+            # Explicitly unsupported cost param: retry with a calculated amount.
             price = self.get_ticker_price(pair)
             if price <= 0:
                 raise Exception(f"Cannot get price for {pair}")
@@ -392,7 +408,6 @@ class MexcClient:
     def cancel_open_buy_orders(self, symbol: str) -> dict:
         """Cancel open BUY limit orders for a symbol (crash-hunt cleanup)."""
         result = {"cancelled": [], "errors": []}
-        pair = f"{symbol}/{self.quote}" if "/" not in symbol else symbol
         try:
             orders = self.fetch_open_orders(symbol)
             for o in orders:
@@ -412,16 +427,30 @@ class MexcClient:
         return result
 
 
+    # Exchange messages meaning the order is already gone (cancel is a no-op,
+    # not a failure). Anything else is a real error and must be surfaced.
+    _ORDER_GONE_MARKERS = (
+        "already canceled", "already cancelled", "order not exist",
+        "order does not exist", "order_not_exist", "unknown order", "not found",
+        "30005",
+    )
+
     def cancel_order(self, order_id: str, symbol: str, strict: bool = False) -> Optional[dict]:
-        """Cancel an open order by id."""
+        """Cancel an open order by id.
+
+        Returns the exchange response on success. When the order is already
+        closed, returns a synthetic `already_gone` result (so callers can treat
+        it as success). Any other error is raised — silently swallowing it hides
+        release failures and can leave tracked positions stranded.
+        """
         pair = f"{symbol}/{self.quote}" if "/" not in symbol else symbol
         try:
             return self.exchange.cancel_order(order_id, pair)
-        except Exception as e:
-            # Order may already be filled/cancelled
-            if strict:
-                raise
-            return None
+        except Exception as exc:
+            message = str(exc).lower()
+            if any(marker in message for marker in self._ORDER_GONE_MARKERS):
+                return {"id": order_id, "status": "canceled", "already_gone": True}
+            raise Exception(f"Cancel order {order_id} failed: {exc}")
 
     def fetch_open_orders(self, symbol: str = None, strict: bool = False) -> List[dict]:
         """Fetch open orders; strict mode propagates exchange/API failures."""
@@ -602,7 +631,6 @@ class MexcClient:
             # fallback محافظ — يمنع أي دخول عشوائي
             return {
                 "netflow": "neutral",
-                "whales": "neutral",
                 "volume_weak": True,
                 "candle_strength": "weak",
                 "flow_bias": "neutral",
@@ -649,14 +677,6 @@ class MexcClient:
         else:
             regime = "consolidation"
 
-        # على السلسلة / مزاج / أخبار: محايد حالياً (مصادر خارجية لاحقاً)
-        # لكن نستخدم orderflow كإشارة تقريبية للسيولة الفورية
-        whales = "neutral"
-        if orderflow == "buy" and not volume_weak:
-            whales = "accumulate"
-        elif orderflow == "sell" and not volume_weak:
-            whales = "distribute"
-
         used = ", ".join(per_symbol.keys())
         detail = " | ".join(
             f"{k}:T={v['trend']}/V={v['vol_ratio']}/R={v['range_pct']}%"
@@ -665,7 +685,6 @@ class MexcClient:
 
         return {
             "netflow": "neutral",
-            "whales": whales,
             "volume_weak": volume_weak,
             "candle_strength": candle,
             "flow_bias": orderflow,

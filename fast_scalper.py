@@ -2,7 +2,6 @@ from __future__ import annotations
 import json, logging, threading, time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
 
 import ccxt
 import websocket

@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-from supertrend import compute_supertrend, signal_label
+from supertrend import compute_supertrend
 
 logger = logging.getLogger(__name__)
 

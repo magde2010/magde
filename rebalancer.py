@@ -406,7 +406,6 @@ class Rebalancer:
         """Return TP actions only after MEXC reports a manual limit fill."""
         actions = []
         for coin in positions:
-            portfolio = getattr(coin, "portfolio", None)
             status = str(getattr(coin, "position_status", "open") or "open")
             if status == "open":
                 stage, key, fallback_pct, fallback_price = "tp1", "tp1_order_id", 40.0, coin.tp1_price

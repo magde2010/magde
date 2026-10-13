@@ -6,8 +6,11 @@ load_dotenv()
 # MEXC (مطلوب)
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
-COINLOBSTER_API_KEY = os.getenv("COINLOBSTER_API_KEY", "")
 DATABASE_URL = os.getenv("DATABASE_URL")
+# Railway/Heroku may expose the legacy `postgres://` scheme, which SQLAlchemy 2.x
+# rejects. Normalise it so the process can actually start against Postgres.
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")

@@ -1,5 +1,5 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from fast_scalper import get_scalper, get_settings, update_settings
+from fast_scalper import get_scalper, get_settings
 
 def scalper_keyboard(s):
     mode="🟡 تجريبي" if s.mode=="PAPER" else "🔴 حقيقي"

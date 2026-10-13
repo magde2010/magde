@@ -3,10 +3,8 @@
     بوت تليجرام لإدارة محافظ متعددة على MEXC Spot بأهداف ووقف خسارة يدويين.
 """
 import logging
-import re
 import asyncio
-import json
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 from datetime import datetime, timedelta
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
@@ -21,30 +19,21 @@ from telegram.ext import (
 )
 
 import config
-import crash_hunter
 from crash_hunter import (
     parse_levels, default_manual_levels, analyze_market_for_auto,
     place_crash_ladder, cancel_crash_orders, format_result as format_crash_result,
     update_settings as crash_update_settings, get_settings as crash_get_settings,
     monitor_crash_fills, status_summary as crash_status_summary,
 )
-import smart_whale_control
-from whale_reco import (
-    fetch_recommendations, format_reco_message,
-    whale_auto_start, whale_auto_stop, whale_status_text, whale_auto_tick,
-    get_whale_runtime, WhaleAutoSettings, save_whale_state,
-    whale_settings_dict, apply_whale_settings,
-)
-from whale_reco import fetch_recommendations, format_reco_message
 from database import (
     init_db, SessionLocal, get_or_create_user, get_portfolios, get_portfolio,
     create_portfolio, add_coin_to_portfolio, remove_coin_from_portfolio,
     close_portfolio, delete_portfolio_completely, clear_coin_position,
     delete_orphaned_portfolio_records,
     set_portfolio_running, log_action,
-    Portfolio, PortfolioCoin, PortfolioTrade, RebalanceLog, UserSettings,
+    Portfolio, PortfolioCoin, PortfolioTrade, RebalanceLog,
     update_coin_position, reset_coin_positions, get_open_positions,
-    record_trade_event, get_trade_event, get_reentry_candidates,
+    record_trade_event, get_trade_event,
     get_portfolio_trade_events, mark_reentry_events_used,
     reset_portfolio_cycle_state,
 )
@@ -121,39 +110,6 @@ def _outstanding_trim_amounts(db, portfolio_id: int, telegram_id: int):
     return {key: {"symbol": key[1], "amount": amount} for key, amount in totals.items()}
 
 
-
-
-def _persist_whale_settings(telegram_id: int) -> None:
-    """Store whale settings in the durable application database."""
-    db = SessionLocal()
-    try:
-        user = get_or_create_user(db, telegram_id)
-        user.whale_auto_settings_json = json.dumps(
-            whale_settings_dict(), ensure_ascii=False, sort_keys=True
-        )
-        user.smart_whale_settings_json = json.dumps(
-            smart_whale_control.load_settings(), ensure_ascii=False, sort_keys=True
-        )
-        db.commit()
-    finally:
-        db.close()
-
-
-def _load_whale_settings(telegram_id: int) -> None:
-    """Restore durable whale settings, leaving file-based state as fallback."""
-    db = SessionLocal()
-    try:
-        user = db.query(UserSettings).filter(UserSettings.telegram_id == telegram_id).first()
-        if not user:
-            return
-        if user.whale_auto_settings_json:
-            apply_whale_settings(json.loads(user.whale_auto_settings_json))
-        if user.smart_whale_settings_json:
-            smart_whale_control.apply_settings(json.loads(user.smart_whale_settings_json))
-    except (ValueError, TypeError, json.JSONDecodeError) as exc:
-        logger.warning("load whale settings: %s", exc)
-    finally:
-        db.close()
 
 
 def get_mexc() -> MexcClient:
@@ -675,7 +631,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.close()
     await update.message.reply_text(
         ui.page_title("◆", "LOTFE", "إدارة محافظ MEXC Spot بواجهة عصرية وواضحة.") +
-        "\nإدارة المحافظ • التداول الفوري • Flow Engine\n"
+        "\nإدارة المحافظ • إعادة الموازنة • اصطياد الهبوط\n"
         "اختر القسم المطلوب من القائمة أدناه.",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard(),
@@ -784,94 +740,6 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"خطأ: {e}")
                 return
 
-        smart_wait = context.user_data.get("smart_whale_wait")
-        if smart_wait:
-            field = smart_wait.get("field")
-            raw = text.strip()
-            try:
-                if field == "radar_window":
-                    value = raw.lower().replace(" ", "")
-                    if value not in {"1h", "4h", "12h", "24h", "7d"}:
-                        raise ValueError("القيم المسموحة: 1h أو 4h أو 12h أو 24h أو 7d")
-                else:
-                    number = float(raw.replace(",", ".").replace("$", "").replace("%", ""))
-                    bounds = {
-                        "allocated_capital": (10.0, 1_000_000.0),
-                        "position_size_usdt": (5.0, 100_000.0),
-                        "max_open_positions": (1.0, 50.0),
-                        "min_multiple": (1.0, 100.0),
-                        "stop_loss_pct": (0.1, 90.0),
-                        "take_profit_1_pct": (0.1, 500.0),
-                        "take_profit_2_pct": (0.1, 1000.0),
-                        "check_interval_minutes": (1.0, 1440.0),
-                        "min_order_usdt": (1.0, 1000.0),
-                        "max_slippage_pct": (0.1, 20.0),
-                    }
-                    low, high = bounds[field]
-                    if not low <= number <= high:
-                        raise ValueError(f"القيمة يجب أن تكون بين {low:g} و {high:g}")
-                    value = int(number) if field in {"max_open_positions", "check_interval_minutes"} else number
-                smart_whale_control.update_setting(field, value)
-                _persist_whale_settings(tid)
-                context.user_data.pop("smart_whale_wait", None)
-                context.user_data.pop("waiting", None)
-                await update.message.reply_text(
-                    f"✅ تم حفظ إعداد *{smart_whale_control.FIELD_LABELS[field]}*.\n"
-                    "سيُطبّق عند تشغيل النظام التالي.",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")],
-                    ]),
-                )
-            except Exception as exc:
-                await update.message.reply_text(
-                    f"❌ قيمة غير صحيحة: `{str(exc)}`",
-                    parse_mode="Markdown",
-                )
-            return
-
-        whale_field = context.user_data.get("edit_whale_field")
-        if whale_field:
-            try:
-                raw = text.strip().replace(",", ".").replace("%", "").replace("$", "")
-                rt = get_whale_runtime()
-                s = rt.settings
-                if whale_field == "size":
-                    s.size_usdt = max(5.0, min(5000.0, float(raw))); val = s.size_usdt
-                elif whale_field == "max":
-                    s.max_positions = max(1, min(20, int(float(raw)))); val = s.max_positions
-                elif whale_field == "score":
-                    s.min_score = max(65.0, min(95.0, float(raw))); val = s.min_score
-                elif whale_field == "confirm":
-                    s.confirmations_required = max(1, min(5, int(float(raw)))); val = s.confirmations_required
-                elif whale_field == "liveconfirm":
-                    s.live_confirmations_required = max(2, min(5, int(float(raw)))); val = s.live_confirmations_required
-                elif whale_field == "tp":
-                    s.take_profit_pct = max(1.0, min(50.0, float(raw))); val = s.take_profit_pct
-                elif whale_field == "sl":
-                    s.stop_loss_pct = max(1.0, min(30.0, float(raw))); val = s.stop_loss_pct
-                elif whale_field == "interval":
-                    s.scan_interval_seconds = max(15, min(3600, int(float(raw)))); val = s.scan_interval_seconds
-                elif whale_field == "exposure":
-                    s.max_exposure_usdt = max(0.0, min(1000000.0, float(raw))); val = s.max_exposure_usdt
-                else:
-                    await update.message.reply_text("حقل غير معروف")
-                    return
-                save_whale_state()
-                _persist_whale_settings(tid)
-                context.user_data.pop("edit_whale_field", None)
-                context.user_data.pop("waiting", None)
-                await update.message.reply_text(
-                    f"✅ حيتان: `{whale_field}` = `{val}`",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")],
-                    ]),
-                )
-            except Exception as e:
-                await update.message.reply_text(f"خطأ: {e}")
-            return
-
         user_field = context.user_data.get("edit_user_tpsl")
         if user_field:
             try:
@@ -952,10 +820,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     data = query.data or ""
     tid = update.effective_user.id
-    # توحيد أي زر قديم محفوظ في رسائل Telegram مع شاشة الحيتان الرئيسية.
-    if data == "smart_whale_menu":
-        data = "whale_reco_menu"
-
     if data == "menu":
         await query.edit_message_text(
             ui.page_title(ui.I["home"], "لوحة التحكم", "اختار القسم المطلوب من القائمة:") + ui.footer(),
@@ -967,7 +831,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data in ("market_report", "auto_sys_status"):
         db = SessionLocal()
         try:
-            await query.edit_message_text("⏳ جاري جمع بيانات السوق ورادار الحيتان...", parse_mode="Markdown")
+            await query.edit_message_text("⏳ جاري جمع بيانات السوق والمحافظ...", parse_mode="Markdown")
             report = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: build_market_report(get_mexc(), db, tid),
             )
@@ -1209,195 +1073,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         finally:
             db.close()
-        return
-
-    # ========== نظام الحيتان الذكي المستقل ==========
-    if data == "smart_whale_menu":
-        running = smart_whale_control.is_running()
-        text = (
-            ui.page_title(ui.I["flow"], "Flow Engine", "تحليل مبكر لتجميع الحيتان قبل الحركة.") + "\n"
-            "يبحث عن تجميع الحيتان المبكر ويؤكده بالسعر والحجم وCVD وOrder Book قبل التداول.\n\n"
-            f"الحالة: {smart_whale_control.status_text()}\n\n"
-            "⚠️ التشغيل الحقيقي يظل منفصلًا ويتطلب مفاتيح MEXC وتأكيد المستخدم."
-        )
-        rows = []
-        if running:
-            rows.append([InlineKeyboardButton(f"{ui.I['stop']}  إيقاف النظام", callback_data="smart_whale_stop")])
-        else:
-            rows.append([InlineKeyboardButton(f"{ui.I['play']}  تشغيل النظام", callback_data="smart_whale_start_confirm")])
-        rows.append([InlineKeyboardButton(f"{ui.I['settings']}  إعدادات التداول", callback_data="smart_whale_settings")])
-        rows.append([InlineKeyboardButton("🔄 تحديث الحالة", callback_data="smart_whale_menu")])
-        rows.append([InlineKeyboardButton(f"{ui.I['back']}  القائمة", callback_data="menu")])
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if data == "smart_whale_settings":
-        rt = get_whale_runtime()
-        s = rt.settings
-        rows = [
-            [InlineKeyboardButton(f"▣  حجم الصفقة: ${s.size_usdt:g}", callback_data="whale_set_size"),
-             InlineKeyboardButton(f"▤  أقصى مراكز: {s.max_positions}", callback_data="whale_set_max")],
-            [InlineKeyboardButton(f"{ui.I['flow']}  قوة الإشارة: {s.min_score:g}", callback_data="whale_set_score"),
-             InlineKeyboardButton(f"{ui.I['save']}  التأكيدات: {s.confirmations_required}", callback_data="whale_set_confirm")],
-            [InlineKeyboardButton(f"{ui.I['live']}  تأكيد Live: {s.live_confirmations_required}", callback_data="whale_set_liveconfirm"),
-             InlineKeyboardButton(f"{ui.I['target']}  الهدف: {s.take_profit_pct:g}%", callback_data="whale_set_tp")],
-            [InlineKeyboardButton(f"{ui.I['danger']}  الوقف: {s.stop_loss_pct:g}%", callback_data="whale_set_sl")],
-            [InlineKeyboardButton(f"{ui.I['clock']}  الفحص: {s.scan_interval_seconds}ث", callback_data="whale_set_interval"),
-             InlineKeyboardButton(
-                 f"▤  التعرض: {'تلقائي' if s.max_exposure_usdt <= 0 else f'${s.max_exposure_usdt:g}'}",
-                 callback_data="whale_set_exposure",
-             )],
-            [InlineKeyboardButton(f"{ui.I['refresh']}  تحديث", callback_data="smart_whale_settings"),
-             InlineKeyboardButton(f"{ui.I['back']}  Flow Engine", callback_data="whale_reco_menu")],
-        ]
-        await query.edit_message_text(
-            ui.page_title("⚙", "إعدادات الحيتان", "اضغط على أي قيمة لتعديلها.") + "\n"
-            "هذه هي الإعدادات الفعلية المستخدمة عند التشغيل.\n"
-            "اضغط على أي قيمة لتعديلها، ثم ارجع للتشغيل.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
-        return
-
-    smart_setting_prompts = {
-        "smart_set_allocated_capital": ("allocated_capital", "أرسل رأس المال المخصص بالدولار (10 إلى 1,000,000)."),
-        "smart_set_position_size": ("position_size_usdt", "أرسل حجم الصفقة الواحدة بالدولار (5 إلى 100,000)."),
-        "smart_set_max_positions": ("max_open_positions", "أرسل أقصى عدد للصفقات المفتوحة (1 إلى 50)."),
-        "smart_set_min_multiple": ("min_multiple", "أرسل قوة إشارة الحيتان، مثال: 2.5."),
-        "smart_set_stop_loss": ("stop_loss_pct", "أرسل وقف الخسارة كنسبة مئوية، مثال: 7."),
-        "smart_set_tp1": ("take_profit_1_pct", "أرسل الهدف الأول كنسبة مئوية، مثال: 8."),
-        "smart_set_tp2": ("take_profit_2_pct", "أرسل الهدف الثاني كنسبة مئوية، مثال: 15."),
-        "smart_set_interval": ("check_interval_minutes", "أرسل فاصل الفحص بالدقائق (1 إلى 1440)."),
-        "smart_set_radar_window": ("radar_window", "أرسل نافذة الرادار، مثال: 1h أو 4h أو 24h."),
-        "smart_set_min_order": ("min_order_usdt", "أرسل الحد الأدنى للأمر بالدولار (1 إلى 1000)."),
-        "smart_set_slippage": ("max_slippage_pct", "أرسل أقصى انزلاق سعري كنسبة (0.1 إلى 20)."),
-    }
-    if data in smart_setting_prompts:
-        field, prompt = smart_setting_prompts[data]
-        context.user_data["waiting"] = True
-        context.user_data["smart_whale_wait"] = {"field": field}
-        await query.edit_message_text(
-            f"⚙️ إعداد: *{smart_whale_control.FIELD_LABELS[field]}*\n\n{prompt}",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{ui.I['back']}  رجوع", callback_data="whale_reco_menu")],
-            ]),
-        )
-        return
-
-    if data == "smart_whale_start_confirm":
-        await query.edit_message_text(
-            "⚠️ *تأكيد تشغيل التداول الآلي*\n\n"
-            "سيبدأ النظام بفحص إشارات الحيتان وقد ينفذ صفقات حقيقية على MEXC.\n"
-            "تأكد من إعداد مفاتيح API وحدود التداول أولًا.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{ui.I['save']}  تأكيد التشغيل", callback_data="smart_whale_start")],
-                [InlineKeyboardButton(f"{ui.I['back']}  رجوع", callback_data="whale_reco_menu")],
-            ]),
-        )
-        return
-
-    if data == "smart_whale_start":
-        ok, msg = await asyncio.get_event_loop().run_in_executor(None, smart_whale_control.start)
-        await query.edit_message_text(
-            ("✅ " if ok else "❌ ") + msg,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")],
-                [InlineKeyboardButton(f"{ui.I['back']}  القائمة", callback_data="menu")],
-            ]),
-        )
-        return
-
-    if data == "smart_whale_stop":
-        ok, msg = await asyncio.get_event_loop().run_in_executor(None, smart_whale_control.stop)
-        await query.edit_message_text(
-            ("✅ " if ok else "ℹ️ ") + msg,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")],
-                [InlineKeyboardButton(f"{ui.I['back']}  القائمة", callback_data="menu")],
-            ]),
-        )
-        return
-
-    # ========== توصيات وشراء الحيتان التلقائي ==========
-    if data == "whale_reco_menu" or data == "whale_auto_menu":
-        rt = get_whale_runtime()
-        s = rt.settings
-        text = whale_status_text(get_mexc() if rt.active else None)
-        try:
-            items = await asyncio.get_event_loop().run_in_executor(None, lambda: fetch_recommendations(5))
-            changes = {}
-            client = get_mexc()
-            for item in items:
-                try:
-                    ticker = client.exchange.fetch_ticker(f"{item['symbol']}/USDT")
-                    if ticker and ticker.get("percentage") is not None:
-                        changes[item["symbol"]] = float(ticker["percentage"])
-                except Exception:
-                    pass
-            text += "\n\n" + format_reco_message(items, changes)
-        except Exception as exc:
-            text += f"\n\n(تعذر الرادار: {exc})"
-        rows = []
-        rows.append([InlineKeyboardButton(f"{ui.I['stop']}  إيقاف", callback_data="whale_auto_stop")] if rt.active else [InlineKeyboardButton(f"{ui.I['play']}  تشغيل تلقائي", callback_data="whale_auto_start")])
-        mode_lab = "🧪 تجريبي" if s.mode == "paper" else "💰 حقيقي"
-        rows.append([InlineKeyboardButton(f"الوضع: {mode_lab}", callback_data="whale_toggle_mode")])
-        rows.append([InlineKeyboardButton(f"{ui.I['settings']}  إعدادات متقدمة", callback_data="smart_whale_settings")])
-        rows.append([InlineKeyboardButton(f"{ui.I['refresh']}  تحديث", callback_data="whale_reco_menu"), InlineKeyboardButton(f"{ui.I['back']}  القائمة", callback_data="menu")])
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if data == "whale_toggle_mode":
-        rt = get_whale_runtime()
-        if rt.active:
-            await query.edit_message_text("أوقف النظام أولًا.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")]]))
-            return
-        rt.settings.mode = "live" if rt.settings.mode == "paper" else "paper"
-        save_whale_state()
-        ar = "حقيقي" if rt.settings.mode == "live" else "تجريبي"
-        await query.edit_message_text(f"الوضع: *{ar}*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")]]))
-        return
-
-    if data == "whale_auto_start":
-        rt = get_whale_runtime()
-        if rt.settings.mode == "live":
-            await query.edit_message_text("⚠️ *وضع حقيقي* — تأكيد؟\nسيشتري تلقائيًا عند توصية قوية.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{ui.I['live']}  تأكيد التداول الحقيقي", callback_data="whale_auto_start_live")], [InlineKeyboardButton(f"{ui.I['back']}  رجوع", callback_data="whale_reco_menu")]]))
-            return
-        msg = whale_auto_start(tid, rt.settings)
-        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{ui.I['stop']}  إيقاف", callback_data="whale_auto_stop")], [InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")]]))
-        return
-
-    if data == "whale_auto_start_live":
-        rt = get_whale_runtime()
-        rt.settings.mode = "live"
-        msg = whale_auto_start(tid, rt.settings)
-        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{ui.I['stop']}  إيقاف", callback_data="whale_auto_stop")], [InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")]]))
-        return
-
-    if data == "whale_auto_stop":
-        msg = whale_auto_stop(get_mexc())
-        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{ui.I['flow']}  Flow Engine", callback_data="whale_reco_menu")], [InlineKeyboardButton(f"{ui.I['back']}  القائمة", callback_data="menu")]]))
-        return
-
-    if data.startswith("whale_set_"):
-        field = data[len("whale_set_"):]
-        labels = {
-            "size": "حجم الصفقة بالدولار (5 إلى 5000)",
-            "max": "أقصى مراكز مفتوحة (1 إلى 20)",
-            "score": "حد قوة الإشارة للشراء (65 إلى 95)",
-            "confirm": "عدد التأكيدات قبل الشراء الورقي (1 إلى 5)",
-            "liveconfirm": "عدد التأكيدات قبل الشراء الحقيقي (2 إلى 5)",
-            "tp": "هدف الربح % (1 إلى 100)",
-            "sl": "وقف الخسارة % (1 إلى 50)",
-            "interval": "فاصل الفحص بالثواني (15 إلى 3600)",
-            "exposure": "سقف إجمالي التعرض بالدولار (0 = تلقائي)",
-        }
-        context.user_data["waiting"] = True
-        context.user_data["edit_whale_field"] = field
-        await query.edit_message_text(f"أرسل *{labels.get(field, field)}*:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"{ui.I['back']}  رجوع", callback_data="whale_reco_menu")]]))
         return
 
     if data == "list_pf":
@@ -2004,11 +1679,6 @@ async def _do_rebuild_positions(query, tid, pf_id):
                     cancel_errors.append(f"{coin.symbol}: {e.get('error', e)}")
             except Exception as exc:
                 cancel_errors.append(f"{coin.symbol}: {exc}")
-            try:
-                extra = client.cancel_all_open_sells(coin.symbol)
-                cancelled_count += len(extra.get("cancelled") or [])
-            except Exception:
-                pass
             # Clear order IDs from DB immediately
             update_coin_position(
                 db, coin.id,
@@ -2095,10 +1765,6 @@ async def _do_rebuild_positions(query, tid, pf_id):
                 free_amt = float(client.get_free_amount(coin.symbol) or 0)
                 # بعد إلغاء الأوامر يفترض الرصيد حر؛ لو مقفول نحاول الإجمالي
                 if free_amt < sell_amt * 0.5:
-                    try:
-                        client.cancel_all_open_sells(coin.symbol)
-                    except Exception:
-                        pass
                     await asyncio.sleep(0.4)
                     free_amt = float(client.get_free_amount(coin.symbol) or 0)
                 sell_amt = min(sell_amt, free_amt * 0.998) if free_amt > 0 else sell_amt
@@ -3509,13 +3175,6 @@ async def _do_stop(query, tid, pf_id):
                         n += 1
                     except Exception as exc:
                         logger.warning("stop cancel %s %s: %s", sym, oid, exc)
-                try:
-                    extra = client.cancel_all_open_sells(sym)
-                    n += len(extra.get("cancelled") or [])
-                    for e in (extra.get("errors") or []):
-                        errs.append(f"{sym}: {e}")
-                except Exception as exc:
-                    errs.append(f"{sym}: {exc}")
             return n, errs
 
         try:
@@ -3597,7 +3256,6 @@ async def _do_stop(query, tid, pf_id):
                     logger.exception("record stop trade %s", sym)
             await asyncio.sleep(0.25)
 
-        from database import reset_coin_positions
         reset_coin_positions(db, pf_id)
         set_portfolio_running(db, pf_id, False)
         log_action(
@@ -3706,8 +3364,6 @@ async def _do_stop_all(query, tid):
 
 async def _do_remove_coin(query, tid, pf_id, symbol):
     """حذف عملة: إلغاء أوامرها ثم بيع الرصيد بسعر السوق ثم شيلها من القاعدة."""
-    import time as _time
-
     db = SessionLocal()
     try:
         p = get_portfolio(db, pf_id, tid)
@@ -3753,15 +3409,6 @@ async def _do_remove_coin(query, tid, pf_id, symbol):
                     # أمر منتهي/ملغي مسبقاً — نكمل
                     logger.warning("cancel %s %s: %s", sym, oid, exc)
                     res["errors"].append(str(exc))
-            # من المنصة مباشرة
-            try:
-                extra = client.cancel_all_open_sells(sym)
-                res["cancelled"].extend(extra.get("cancelled") or [])
-                for e in (extra.get("errors") or []):
-                    res["errors"].append(str(e))
-            except Exception as exc:
-                logger.warning("cancel_all_open_sells %s: %s", sym, exc)
-                res["errors"].append(str(exc))
             return res
 
         try:
@@ -4047,21 +3694,6 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("monitor_crash_fills")
 
-
-    try:
-        whale_msgs = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: whale_auto_tick(get_mexc()),
-        )
-        admin_id = getattr(config, "ADMIN_TELEGRAM_ID", None)
-        for wm in whale_msgs or []:
-            if not admin_id:
-                break
-            try:
-                await context.bot.send_message(admin_id, wm, parse_mode="Markdown")
-            except Exception:
-                pass
-    except Exception:
-        logger.exception("whale_auto_tick")
 
     db = SessionLocal()
     try:
@@ -4492,9 +4124,6 @@ def main():
         raise SystemExit("DATABASE_URL مطلوب")
 
     init_db()
-    # Strategy tables are isolated and do not modify portfolio records/models.
-    if config.ADMIN_TELEGRAM_ID:
-        _load_whale_settings(config.ADMIN_TELEGRAM_ID)
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
     app.bot_data["get_mexc"] = get_mexc
 

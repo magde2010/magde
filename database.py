@@ -33,9 +33,6 @@ class UserSettings(Base):
     be_lock_pct = Column(Float, default=4.0)    # بعد ربح X% → قفل عند الدخول
     # legacy single field kept for migration compatibility
     take_profit_pct = Column(Float, default=5.0)
-    # Persistent whale-system settings; JSON keeps the schema extensible.
-    whale_auto_settings_json = Column(Text, nullable=True)
-    smart_whale_settings_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -354,9 +351,6 @@ def init_db():
 
         if "user_settings" in insp.get_table_names():
             cols = [c["name"] for c in insp.get_columns("user_settings")]
-            for col in ("whale_auto_settings_json", "smart_whale_settings_json"):
-                if col not in cols:
-                    conn.execute(text(f"ALTER TABLE user_settings ADD COLUMN {col} TEXT"))
             for col, default in [
                 ("take_profit_pct", "5.0"),
                 ("stop_loss_pct", "3.0"),
