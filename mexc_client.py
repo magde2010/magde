@@ -116,6 +116,12 @@ class MexcClient:
         ticker = self.exchange.fetch_ticker(symbol)
         return float(ticker['last'])
 
+    def get_ticker_change_pct(self, symbol: str):
+        """Return the exchange-reported 24-hour percentage change, if available."""
+        ticker = self.exchange.fetch_ticker(symbol)
+        value = ticker.get("percentage")
+        return float(value) if value is not None else None
+
     def get_all_prices(self, symbols: List[str]) -> Dict[str, float]:
         """symbols = ['BTC', 'ETH'] -> prices in USDT.
         Uses batch fetch_tickers when possible for much higher speed.
