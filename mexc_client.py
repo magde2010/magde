@@ -146,78 +146,6 @@ class MexcClient:
                     prices[s] = 0.0
         return prices
 
-    def get_expert_market_context(self, symbols: List[str], timeframe: str = "1h") -> Dict:
-        """Build a conservative, read-only market context for the expert engine."""
-        allowed = {"15m", "1h", "4h", "1d", "1w"}
-        tf = timeframe if timeframe in allowed else "1h"
-        clean = [self.normalize_asset_symbol(s) for s in (symbols or [])]
-        contexts = []
-        for symbol in list(dict.fromkeys(clean))[:12]:
-            pair = f"{symbol}/{self.quote}"
-            try:
-                candles = self.exchange.fetch_ohlcv(pair, timeframe=tf, limit=80)
-                if len(candles) < 30:
-                    continue
-                closes = [float(row[4]) for row in candles]
-                volumes = [float(row[5] or 0) for row in candles]
-                last = closes[-1]
-                sma20 = sum(closes[-20:]) / 20.0
-                sma50 = sum(closes[-50:]) / 50.0 if len(closes) >= 50 else sma20
-                momentum_return = (last / closes[-6] - 1.0) if closes[-6] else 0.0
-                avg_volume = sum(volumes[-21:-1]) / 20.0 if sum(volumes[-21:-1]) else 0.0
-                volume_ratio = (volumes[-1] / avg_volume) if avg_volume else 0.0
-                high20 = max(closes[-21:-1])
-                low20 = min(closes[-21:-1])
-                candle_range = max(float(candles[-1][2]) - float(candles[-1][3]), 0.0)
-                candle_body = abs(float(candles[-1][4]) - float(candles[-1][1]))
-                imbalance = 0.0
-                trend = "up" if last > sma20 * 1.002 and sma20 >= sma50 else (
-                    "down" if last < sma20 * 0.998 and sma20 <= sma50 else "sideways"
-                )
-                momentum = "strong" if abs(momentum_return) >= 0.015 else (
-                    "cool" if abs(momentum_return) >= 0.004 else "weak"
-                )
-                candle_strength = "strong" if candle_range and candle_body / candle_range >= 0.55 else "weak"
-                consolidation = ((high20 - low20) / last) < 0.04 if last else True
-                breakout = (last > high20 * 1.001 or last < low20 * 0.999) and volume_ratio >= 1.15
-                contexts.append({
-                    "trend": trend,
-                    "momentum": momentum,
-                    "volume_weak": volume_ratio < 0.80,
-                    "candle_strength": candle_strength,
-                    "flow_bias": "buy" if imbalance > 0.12 else ("sell" if imbalance < -0.12 else "neutral"),
-                    "consolidation": consolidation,
-                    "breakout_confirmed": breakout,
-                    "rr_ok": bool(not consolidation and abs(momentum_return) >= 0.008),
-                    "regime": "uptrend" if trend == "up" else ("downtrend" if trend == "down" else "consolidation"),
-                    "symbols_used": symbol,
-                })
-            except Exception:
-                continue
-        if not contexts:
-            return {
-                "volume_weak": True, "candle_strength": "weak", "flow_bias": "neutral",
-                "trend": "sideways", "momentum": "cool", "regime": "consolidation",
-                "consolidation": True, "breakout_confirmed": False, "rr_ok": False,
-                "data_source": "unavailable",
-            }
-        def majority(key, default):
-            values = [c.get(key, default) for c in contexts]
-            return max(set(values), key=values.count)
-        return {
-            "trend": majority("trend", "sideways"),
-            "momentum": majority("momentum", "cool"),
-            "volume_weak": sum(bool(c.get("volume_weak")) for c in contexts) > len(contexts) / 2,
-            "candle_strength": majority("candle_strength", "weak"),
-            "flow_bias": majority("flow_bias", "neutral"),
-            "consolidation": sum(bool(c.get("consolidation")) for c in contexts) > len(contexts) / 2,
-            "breakout_confirmed": sum(bool(c.get("breakout_confirmed")) for c in contexts) >= max(1, len(contexts) // 2),
-            "rr_ok": sum(bool(c.get("rr_ok")) for c in contexts) > len(contexts) / 2,
-            "regime": majority("regime", "consolidation"),
-            "data_source": "MEXC public OHLCV",
-            "symbols_used": ", ".join(c["symbols_used"] for c in contexts),
-        }
-
     def get_portfolio_value(self) -> Dict:
         """
         Returns full account value.
@@ -229,7 +157,7 @@ class MexcClient:
             }
         }
         """
-        balances = self.get_balance()
+        balances = self.get_total_balance()
         if not balances:
             return {'total_usdt': 0.0, 'assets': {}}
 
@@ -495,20 +423,22 @@ class MexcClient:
                 raise
             return None
 
-    def fetch_open_orders(self, symbol: str = None) -> List[dict]:
-        """Fetch open orders, optionally filtered by symbol."""
+    def fetch_open_orders(self, symbol: str = None, strict: bool = False) -> List[dict]:
+        """Fetch open orders; strict mode propagates exchange/API failures."""
         try:
             if symbol:
                 pair = f"{symbol}/{self.quote}" if "/" not in symbol else symbol
                 return self.exchange.fetch_open_orders(pair)
             return self.exchange.fetch_open_orders()
         except Exception:
+            if strict:
+                raise
             return []
 
     def fetch_open_sell_orders(self, symbol: str) -> List[dict]:
         """Fetch only open sell orders for a base asset."""
         return [
-            order for order in self.fetch_open_orders(symbol)
+            order for order in self.fetch_open_orders(symbol, strict=True)
             if str(order.get("side") or "").lower() == "sell"
         ]
 

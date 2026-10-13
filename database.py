@@ -103,10 +103,6 @@ class PortfolioCoin(Base):
     reentry_price = Column(Float, default=0.0)
     reentry_used = Column(Boolean, default=False)   # only one re-entry per cycle
     reentry_touched = Column(Boolean, default=False)  # price touched reentry zone
-    # Persistent BTC portfolio-risk execution state
-    btc_risk_level = Column(Integer, default=0)
-    btc_risk_base_amount = Column(Float, default=0.0)
-    btc_risk_last_action_at = Column(DateTime, nullable=True)
     # Persistent exchange-order reconciliation for market buys/re-entry.
     pending_order_id = Column(String(64), nullable=True)
     pending_order_side = Column(String(10), nullable=True)
@@ -348,9 +344,6 @@ def init_db():
                 ("reentry_price", "DOUBLE PRECISION DEFAULT 0"),
                 ("reentry_used", "BOOLEAN DEFAULT FALSE"),
                 ("reentry_touched", "BOOLEAN DEFAULT FALSE"),
-                ("btc_risk_level", "INTEGER DEFAULT 0"),
-                ("btc_risk_base_amount", "DOUBLE PRECISION DEFAULT 0"),
-                ("btc_risk_last_action_at", "TIMESTAMP"),
                 ("pending_order_id", "VARCHAR(64)"),
                 ("pending_order_side", "VARCHAR(10)"),
                 ("pending_order_usdt", "DOUBLE PRECISION DEFAULT 0"),

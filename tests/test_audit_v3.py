@@ -10,7 +10,6 @@ os.environ['MEXC_API_KEY'] = 'x'; os.environ['MEXC_API_SECRET'] = 'y'
 
 from mexc_client import MexcClient
 import crash_hunter
-from btc_risk_governor import BTC_RISK
 
 class BuyExchange:
     def __init__(self, error): self.error=error; self.markets={}; self.calls=0
@@ -36,9 +35,6 @@ class TPClient:
     def create_market_order(self,*args,**kwargs): self.sell.append(args); return {'id':'sell'}
 
 class V3Tests(unittest.TestCase):
-    def setUp(self):
-        BTC_RISK.enabled = False
-
     def test_market_buy_timeout_never_falls_back_to_second_order(self):
         c=MexcClient(); ex=BuyExchange('network timeout'); c.exchange=ex
         with self.assertRaises(Exception): c.create_market_buy_usdt('BTC', 10)
@@ -55,49 +51,6 @@ class V3Tests(unittest.TestCase):
         r=c.create_market_buy_usdt('BTC',10)
         self.assertEqual(r['id'],'buy2'); self.assertEqual(ex.calls,2)
 
-
-    def test_market_buy_uses_btc_risk_multiplier(self):
-        from btc_risk_governor import BTC_RISK
-        old_enabled, old_score, old_raw = BTC_RISK.enabled, BTC_RISK._score, BTC_RISK._raw_score
-        old_change = BTC_RISK._last_score_change
-        try:
-            BTC_RISK.enabled = True
-            BTC_RISK._score = 50.0
-            BTC_RISK._raw_score = 50.0
-            BTC_RISK._last_score_change = __import__('time').time()
-            BTC_RISK._last_update = __import__('time').time()
-            BTC_RISK._prices.clear(); BTC_RISK._prices.append((__import__('time').time(), 100.0)); BTC_RISK._minute_open = 100.0
-            class E:
-                def __init__(self): self.markets={}; self.calls=[]
-                def create_order(self, **kwargs): self.calls.append(kwargs); return {'id':'risk-buy'}
-            c=MexcClient(); ex=E(); c.exchange=ex
-            r=c.create_market_buy_usdt('BTC', 100)
-            self.assertEqual(r['risk_usdt'], 60.0)
-            self.assertEqual(ex.calls[0]['params']['cost'], 60.0)
-        finally:
-            BTC_RISK.enabled, BTC_RISK._score, BTC_RISK._raw_score = old_enabled, old_score, old_raw
-            BTC_RISK._last_score_change = old_change
-
-    def test_limit_buy_uses_btc_risk_multiplier(self):
-        from btc_risk_governor import BTC_RISK
-        old_enabled, old_score = BTC_RISK.enabled, BTC_RISK._score
-        try:
-            BTC_RISK.enabled = True; BTC_RISK._score = 40.0; BTC_RISK._raw_score = 40.0
-            BTC_RISK._last_score_change = __import__('time').time()
-            BTC_RISK._last_update = __import__('time').time()
-            BTC_RISK._prices.clear(); BTC_RISK._prices.append((__import__('time').time(), 100.0)); BTC_RISK._minute_open = 100.0
-            class E:
-                def __init__(self): self.markets={}; self.calls=[]
-                def load_markets(self): self.markets={'BTC/USDT': {'limits': {'amount': {'min': 0}, 'cost': {'min': 1}}}}; return self.markets
-                def market(self, symbol): return self.markets[symbol]
-                def amount_to_precision(self, symbol, amount): return amount
-                def price_to_precision(self, symbol, price): return price
-                def create_order(self, **kwargs): self.calls.append(kwargs); return {'id':'limit-risk'}
-            c=MexcClient(); ex=E(); c.exchange=ex
-            c.create_limit_buy('BTC', 1.0, 100.0)
-            self.assertAlmostEqual(ex.calls[0]['amount'], 0.4, places=6)
-        finally:
-            BTC_RISK.enabled, BTC_RISK._score = old_enabled, old_score
 
     def test_crash_tp_fill_closes_position(self):
         crash_hunter._TRACK.clear(); crash_hunter._PERSISTENCE_LOADED=True

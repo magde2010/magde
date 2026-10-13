@@ -20,7 +20,7 @@ SCALPER_MODE=LIVE
 SCALPER_LIVE_ARMED=true
 ```
 
-المحرك مستقل عن `Rebalancer` و`btc_risk_governor`.
+المحرك مستقل عن `Rebalancer` وإدارة المحافظ الأساسية.
 
 ## قواعد البداية
 
