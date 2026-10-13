@@ -14,7 +14,6 @@ I = {
     "portfolio": "▦",
     "new": "＋",
     "flow": "🐋",
-    "market": "◉",
     "balance": "◍",
     "settings": "⚙",
     "cleanup": "⌫",

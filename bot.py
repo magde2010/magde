@@ -33,7 +33,6 @@ from database import (
 )
 from mexc_client import MexcClient
 from rebalancer import Rebalancer
-from market_report import build_market_report
 import ui_theme as ui
 from portfolio_controls import calculate_portfolio_entry_budget, calculate_safe_trim_amount, calculate_outstanding_trim_amounts
 
@@ -745,31 +744,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data in ("market_report", "auto_sys_status"):
-        db = SessionLocal()
-        try:
-            await query.edit_message_text("⏳ جاري جمع بيانات السوق والمحافظ...", parse_mode="Markdown")
-            report = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: build_market_report(get_mexc(), db, tid),
-            )
-            await query.edit_message_text(
-                report,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"{ui.I['refresh']}  تحديث التقرير", callback_data="market_report")],
-                    [InlineKeyboardButton(f"{ui.I['back']}  القائمة", callback_data="menu")],
-                ]),
-            )
-        except Exception as exc:
-            logger.exception("market report")
-            await query.edit_message_text(
-                f"⚠️ تعذر إعداد التقرير: `{str(exc)[:200]}`",
-                parse_mode="Markdown",
-                reply_markup=main_menu_keyboard(),
-            )
-        finally:
-            db.close()
-        return
     if data == "list_pf":
         db = SessionLocal()
         try:
