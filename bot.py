@@ -52,10 +52,7 @@ from mexc_client import MexcClient
 from rebalancer import Rebalancer
 from market_report import build_market_report
 import ui_theme as ui
-from liquidity_swings import init_liquidity_db
 from portfolio_controls import calculate_portfolio_entry_budget, calculate_safe_trim_amount, calculate_outstanding_trim_amounts
-from liquidity_swings_telegram import handle_liquidity_callback, handle_liquidity_text, liquidity_scan_job
-from order_book_sniper import get_sniper, get_settings as get_ob_settings, update_settings as update_ob_settings, ensure_order_book_schema, get_symbol_budgets, set_symbol_budget
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -220,8 +217,6 @@ def main_menu_keyboard():
     return ui.markup([
         ui.row((f"{ui.I['portfolio']}  المحافظ", "list_pf"), (f"{ui.I['new']}  محفظة جديدة", "create_pf")),
         ui.row((f"{ui.I['balance']}  الرصيد", "balance"), (f"{ui.I['settings']}  الإعدادات", "settings")),
-        [ui.button("💧  Liquidity Swings MTF · Spot", "liq_home")],
-        [ui.button("🧱  Order Book Liquidity Sniper", "ob_menu")],
         [ui.button(f"{ui.I['cleanup']}  تنظيف البيانات", "cleanup_db")],
     ])
 
@@ -710,91 +705,6 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     tid = update.effective_user.id
 
-    ob_wait = context.user_data.pop("ob_waiting", None)
-    if ob_wait:
-        try:
-            if ob_wait == "watch_symbol":
-                raw_symbols=[x.strip().upper().replace(" ","") for x in re.split(r"[,،\n;]+",text) if x.strip()]
-                symbols=[]
-                for symbol in raw_symbols:
-                    if "/" not in symbol: symbol=symbol.replace("USDT","")+"/USDT"
-                    if not re.fullmatch(r"[A-Z0-9]{2,25}/USDT",symbol): raise ValueError(f"رمز غير صحيح: {symbol}. استخدم مثل ENA/USDT")
-                    if symbol not in symbols: symbols.append(symbol)
-                if not symbols: raise ValueError("أرسل رمزًا واحدًا على الأقل")
-                ex=getattr(get_mexc(),"exchange",get_mexc()); markets=ex.load_markets()
-                invalid=[symbol for symbol in symbols if not markets.get(symbol) or not markets[symbol].get("spot") or not markets[symbol].get("active") or markets[symbol].get("quote")!="USDT"]
-                if invalid: raise ValueError("أزواج غير متاحة على MEXC: "+", ".join(invalid))
-                current=get_ob_settings(tid); items=[x.strip().upper() for x in (current.watch_symbols or "").split(",") if x.strip()]; combined=items[:]
-                for symbol in symbols:
-                    if symbol not in combined: combined.append(symbol)
-                if len(combined)>20: raise ValueError(f"الحد الأقصى 20 عملة، والقائمة ستصبح {len(combined)}")
-                if len(symbols)>1:
-                    update_ob_settings(tid,watch_symbols=",".join(combined)); context.user_data["ob_waiting"]="total_budget_bulk"; context.user_data["ob_bulk_symbols"]=symbols
-                    await update.message.reply_text("✅ تم التحقق من المجموعة:\n"+"، ".join(symbols)+"\n\nأرسل الميزانية العامة بالدولار USDT. ستُقسم بالتساوي، وكل عملة تدخل على 3 دفعات.")
-                    return
-                symbol=symbols[0]; context.user_data["ob_pending_symbol"]=symbol
-                current_settings=get_ob_settings(tid)
-                if float(getattr(current_settings,"total_budget",0) or 0)>0:
-                    items=[x.strip().upper() for x in (current_settings.watch_symbols or "").split(",") if x.strip()]
-                    if symbol not in items:
-                        if len(items)>=20: raise ValueError("وصلت للحد الأقصى وهو 20 عملة مختارة")
-                        items.append(symbol); update_ob_settings(tid,watch_symbols=",".join(items))
-                    share=float(current_settings.total_budget)/len(items)
-                    context.user_data.pop("ob_pending_symbol",None)
-                    await update.message.reply_text(f"✅ تمت إضافة {symbol}.\nالميزانية العامة ${float(current_settings.total_budget):.2f} مقسمة بالتساوي.\nنصيب العملة حاليًا: ${share:.2f}، وكل عملة تدخل على 3 دفعات متساوية: ${share/3:.2f} للدفعة.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ تشغيل "+symbol,callback_data="ob_run_"+symbol.replace("/","~"))],[InlineKeyboardButton("📊 إدارة العملات والصفقات",callback_data="ob_manage"),InlineKeyboardButton("القائمة",callback_data="ob_menu")]]))
-                    return
-                context.user_data["ob_waiting"]="symbol_budget"
-                await update.message.reply_text(f"تم التحقق من {symbol} على MEXC Spot.\nأرسل الميزانية المخصصة لهذه العملة بالدولار USDT (2 دولار على الأقل).")
-                return
-            if ob_wait == "total_budget_bulk":
-                symbols=context.user_data.pop("ob_bulk_symbols",[]); value=float(text.strip().replace("$","").replace(",","."))
-                if value<=0: raise ValueError("الميزانية العامة يجب أن تكون أكبر من صفر")
-                settings=get_ob_settings(tid); count=len([x.strip() for x in (settings.watch_symbols or "").split(",") if x.strip()])
-                if value/count<2: raise ValueError(f"الميزانية لا تكفي؛ تحتاج على الأقل ${count*2:.2f} لعدد {count} عملة")
-                update_ob_settings(tid,total_budget=value); share=value/count
-                await update.message.reply_text(f"✅ تمت إضافة المجموعة بنجاح:\n{', '.join(symbols)}\n\nالميزانية العامة: ${value:.2f}\nنصيب كل عملة: ${share:.2f}\nالدفعة الواحدة: ${share/3:.2f}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 إدارة العملات",callback_data="ob_manage")],[InlineKeyboardButton("▶️ تشغيل كل العملات",callback_data="ob_start"),InlineKeyboardButton("🏠 القائمة",callback_data="ob_menu")]]))
-                return
-            if ob_wait == "symbol_budget":
-                symbol=context.user_data.pop("ob_pending_symbol",None)
-                if not symbol: raise ValueError("انتهت جلسة إضافة العملة. ابدأ من زر إضافة عملة مرة أخرى.")
-                value=float(text.strip().replace("$","").replace(",","."))
-                if value < 2: raise ValueError("الميزانية يجب ألا تقل عن 2 USDT")
-                settings=get_ob_settings(tid)
-                items=[x.strip().upper() for x in (settings.watch_symbols or "").split(",") if x.strip()]
-                if symbol not in items:
-                    if len(items)>=20: raise ValueError("وصلت للحد الأقصى وهو 20 عملة مختارة")
-                    items.append(symbol)
-                update_ob_settings(tid,watch_symbols=",".join(items))
-                set_symbol_budget(tid,symbol,value)
-                await update.message.reply_text(f"✅ تمت إضافة {symbol} بميزانية ${value:.2f}.\nاضغط تشغيل لبدء تحليل دفتر الأوامر لهذا الزوج فقط. لن يشتري قبل تحقق شروط الجدار والسيولة وفرق السعر المقبول.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ تشغيل "+symbol,callback_data="ob_run_"+symbol.replace("/","~"))],[InlineKeyboardButton("📊 إدارة العملات والصفقات",callback_data="ob_manage"),InlineKeyboardButton("القائمة",callback_data="ob_menu")]]))
-                return
-            if ob_wait == "symbol_budget_edit":
-                symbol=context.user_data.pop("ob_budget_edit_symbol",None)
-                if not symbol: raise ValueError("لم يتم تحديد العملة لتعديل ميزانيتها")
-                value=float(text.strip().replace("$","").replace(",","."))
-                if value < 2: raise ValueError("الميزانية يجب ألا تقل عن 2 USDT")
-                set_symbol_budget(tid,symbol,value)
-                await update.message.reply_text(f"✅ تم تحديث ميزانية {symbol} إلى ${value:.2f}.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 إدارة العملات والصفقات",callback_data="ob_manage"),InlineKeyboardButton("الحالة",callback_data="ob_menu")]]))
-                return
-            value = float(text.strip().replace("$","").replace("%","").replace(",","."))
-            if value < 0 or (value == 0 and ob_wait != "total_budget"): raise ValueError("القيمة يجب أن تكون أكبر من صفر")
-            if ob_wait == "total_budget" and value > 0:
-                count=max(1,len([x for x in (get_ob_settings(tid).watch_symbols or "").split(",") if x.strip()]))
-                if value/count < 2: raise ValueError(f"الميزانية لا تكفي للحد الأدنى لكل عملة؛ تحتاج على الأقل ${count*2:.2f}")
-            if ob_wait == "order_usdt": value=max(2.0,value)
-            if ob_wait == "max_positions" and not 1 <= value <= 20: raise ValueError("عدد المراكز من 1 إلى 20")
-            if ob_wait == "dca_entries" and not 1 <= value <= 3: raise ValueError("عدد دفعات الدخول من 1 إلى 3")
-            if ob_wait in ("tp_pct","sl_pct","max_spread_pct","max_wall_distance_pct") and value > 20: raise ValueError("النسبة كبيرة جدًا؛ الحد 20%")
-            if ob_wait == "wall_multiple" and value < 1: raise ValueError("قوة الجدار يجب ألا تقل عن 1x")
-            update_ob_settings(tid, **{ob_wait:int(value) if ob_wait in ("max_positions","scan_symbols","dca_entries") else value})
-            await update.message.reply_text("تم حفظ الإعداد الفعلي في قاعدة البيانات.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ الإعدادات",callback_data="ob_settings"),InlineKeyboardButton("📊 الحالة",callback_data="ob_menu")]]))
-        except Exception as e:
-            await update.message.reply_text(f"قيمة غير صالحة: {e}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("رجوع",callback_data="ob_settings")]]))
-        return
-
-    if await handle_liquidity_text(update, context, get_mexc):
-        return
-
     if context.user_data.get("waiting"):
         # تعديل إعدادات عامة
         # إعداد نسب اصطياد الانهيار اليدوي
@@ -1042,161 +952,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     data = query.data or ""
     tid = update.effective_user.id
-    if data.startswith("liq_"):
-        await handle_liquidity_callback(update, context, get_mexc)
-        return
-    if data.startswith("ob_"):
-        sniper = get_sniper(tid)
-        settings = get_ob_settings(tid)
-        if data in ("ob_menu", "ob_status"):
-            st = sniper.status()
-            mode = "🟡 PAPER" if settings.mode == "PAPER" else "🔴 LIVE"
-            positions = st["positions"]
-            position_lines = [f"• {sym}: دخول {p['entry']:.8g} | كمية {p['amount']:.8g} | قيمة ${p['cost']:.2f}" for sym,p in positions.items()]
-            order_lines = []
-            for sym,o in st["entry_orders"].items():
-                wall = float(o.get("wall") or 0); wall_usdt = float(o.get("wall_usdt") or 0)
-                kind = "محاكاة PAPER" if o.get("paper") else f"أمر MEXC #{o.get('id','?')}"
-                order_lines.append(f"• {sym}: {kind} | الدفعة {int(o.get('dca_index') or 1)}/{int(o.get('dca_total') or 3)} | سعر الأمر {float(o['price']):.10g} | الجدار {wall:.10g} (${wall_usdt:.2f}) | مبلغ الدفعة ${float(o['budget']):.2f}")
-            active_text = "\n".join(position_lines + order_lines) or "لا توجد مراكز أو أوامر دخول معلقة"
-            budgets = st["budgets"]
-            configured = "\n".join(f"• {sym}: ميزانية ${budgets.get(sym, 0):.2f} | {'🟢 يعمل' if sym in st['running_symbols'] else '⚪ متوقف'}" for sym in st["symbols"]) or "لا توجد عملات مضافة"
-            dca_count=min(3,max(1,int(getattr(settings,'dca_entries',3) or 3)))
-            allocation = (f"الميزانية العامة: ${float(getattr(settings,'total_budget',0) or 0):.2f} ÷ {max(1,len(st['symbols']))} عملة | {dca_count} دفعات لكل عملة" if float(getattr(settings,'total_budget',0) or 0)>0 else f"ميزانية منفصلة لكل عملة | {dca_count} دفعات لكل عملة")
-            msg = (f"🧱 ORDER BOOK LIQUIDITY SNIPER\nالحالة: {'🟢 يعمل' if st['enabled'] else '⚪ متوقف'}\n"
-                   f"الوضع: {mode}\nالحد الأدنى للأمر: ${settings.min_order_usdt:g}\n"
-                   f"المراكز/الأوامر النشطة: {len(set(positions) | set(st['entry_orders']))}/20\n"
-                   f"مدة آخر دورة: {st['scan_sec']:.2f}s\nPnL المحقق/تقريبي: ${st['realized']:.4f}\n"
-                   f"آخر خطأ: {st['last_error'] or 'لا يوجد'}\n\n*طريقة توزيع الميزانية*\n{allocation}\n\n*العملات المختارة والميزانيات*\n{configured}\n\n*المراكز والأوامر*\n{active_text}\n\nاضغط زر المتابعة الحية لرؤية تفاصيل كل عملة.")
-            kb=InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ إضافة عملة + ميزانية",callback_data="ob_coin"),InlineKeyboardButton("📊 إدارة الصفقات",callback_data="ob_manage")],
-                [InlineKeyboardButton("📡 المتابعة الحية لكل عملة",callback_data="ob_live")],
-                [InlineKeyboardButton("▶️ تشغيل العملات المحددة",callback_data="ob_start"),InlineKeyboardButton("⏹ إيقاف الكل",callback_data="ob_stop")],
-                [InlineKeyboardButton("⚙️ إعدادات التداول",callback_data="ob_settings"),InlineKeyboardButton(f"⚡ الوضع: {settings.mode}",callback_data="ob_mode")],
-                [InlineKeyboardButton(f"🎯 TP {settings.tp_pct:g}%",callback_data="ob_tp"),InlineKeyboardButton(f"🛑 SL {settings.sl_pct:g}%",callback_data="ob_sl")],
-                [InlineKeyboardButton("🔐 تأكيد LIVE",callback_data="ob_arm"),InlineKeyboardButton("🔄 تحديث",callback_data="ob_status")],
-                [InlineKeyboardButton("↩️ الرئيسية",callback_data="menu")]])
-            await query.edit_message_text(msg,reply_markup=kb,parse_mode="Markdown"); return
-        if data == "ob_live":
-            st=sniper.status(); cards=[]; buttons=[]
-            for sym in st["symbols"]:
-                ws=st.get("wall_status",{}).get(sym,{})
-                if sym in st["positions"]:
-                    p=st["positions"][sym]; sell=ws.get("sell_wall_price")
-                    card=f"*{sym}*\n🟢 *مركز مفتوح*\nسعر الدخول: `{float(p.get('entry') or 0):.10g}` USDT\nالكمية: `{float(p.get('amount') or 0):.10g}`\n"
-                    card += f"أفضل جدار بيعي: `{float(sell):.10g}` USDT" if sell else "أفضل جدار بيعي: لا يوجد حاليًا"
-                elif sym in st["entry_orders"]:
-                    o=st["entry_orders"][sym]
-                    card=(f"*{sym}*\n🟡 *أمر دخول معلّق*\nسعر الدخول: `{float(o.get('price') or 0):.10g}` USDT\n"
-                          f"جدار الشراء: `{float(o.get('wall') or 0):.10g}` USDT\nقيمة الجدار: `${float(o.get('wall_usdt') or 0):.2f}`")
-                else:
-                    wall=ws.get("wall_price")
-                    card=f"*{sym}*\n🔎 *انتظار دخول*\n"
-                    card += f"الجدار المرصود: `{float(wall):.10g}` USDT\nالتأكيدات: `{int(ws.get('confirmations') or 0)}`" if wall else "لا يوجد جدار شراء مؤهل حاليًا"
-                card += f"\nالميزانية: `${st['budgets'].get(sym,0):.2f}` USDT\nالشرح: {ws.get('reason','بانتظار القراءة')}"
-                cards.append(card); buttons.append([InlineKeyboardButton(f"🔍 تفاصيل {sym}",callback_data="ob_live_detail_"+sym.replace("/","~"))])
-            buttons += [[InlineKeyboardButton("🔄 تحديث المتابعة",callback_data="ob_live")],[InlineKeyboardButton("↩️ الرئيسية",callback_data="ob_menu")]]
-            await query.edit_message_text("📡 *المتابعة الحية لكل عملة*\n\n"+("\n\n────────────\n\n".join(cards) or "لا توجد عملات مضافة."),reply_markup=InlineKeyboardMarkup(buttons),parse_mode="Markdown"); return
-        if data.startswith("ob_live_detail_"):
-            sym=data[len("ob_live_detail_"):].replace("~","/").upper(); st=sniper.status(); ws=st.get("wall_status",{}).get(sym,{})
-            lines=[f"📡 *تفاصيل المتابعة — {sym}*",f"الميزانية: `${st['budgets'].get(sym,0):.2f}` USDT",f"الحالة: {ws.get('reason','بانتظار القراءة')}"]
-            if sym in st["positions"]:
-                p=st["positions"][sym]; lines += ["الوضع: 🟢 مركز مفتوح",f"سعر الدخول: `{float(p.get('entry') or 0):.10g}` USDT",f"الكمية: `{float(p.get('amount') or 0):.10g}`"]
-                lines.append(f"أفضل جدار بيعي: `{float(ws['sell_wall_price']):.10g}` USDT" if ws.get("sell_wall_price") else "أفضل جدار بيعي: لا يوجد حاليًا")
-            elif sym in st["entry_orders"]:
-                o=st["entry_orders"][sym]; lines += ["الوضع: 🟡 أمر دخول معلّق",f"سعر الدخول المحدد: `{float(o.get('price') or 0):.10g}` USDT",f"جدار الشراء: `{float(o.get('wall') or 0):.10g}` USDT",f"قيمة الجدار: `${float(o.get('wall_usdt') or 0):.2f}`"]
-            else:
-                lines += ["الوضع: 🔎 انتظار دخول",f"التأكيدات: `{int(ws.get('confirmations') or 0)}`"]
-            await query.edit_message_text("\n".join(lines),reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ كل العملات",callback_data="ob_live")],[InlineKeyboardButton("🏠 الرئيسية",callback_data="ob_menu")]]),parse_mode="Markdown"); return
-        if data == "ob_settings":
-            kb=InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"💰 الميزانية العامة ${float(getattr(settings,'total_budget',0) or 0):g}",callback_data="ob_total_budget"),InlineKeyboardButton(f"🔢 دفعات الدخول {min(3,max(1,int(getattr(settings,'dca_entries',3) or 3)))}",callback_data="ob_dca")],
-                [InlineKeyboardButton(f"📌 أقصى عدد مراكز {min(20,settings.max_positions)} / 20",callback_data="ob_maxpos"),InlineKeyboardButton(f"↔️ فرق السعر المقبول {settings.max_spread_pct:g}%",callback_data="ob_spread")],
-                [InlineKeyboardButton(f"🧱 قوة الجدار المطلوبة {settings.wall_multiple:g} مرات",callback_data="ob_wall"),InlineKeyboardButton(f"📍 بُعد الجدار المقبول {settings.max_wall_distance_pct:g}%",callback_data="ob_distance")],
-                [InlineKeyboardButton(f"🎯 هدف الربح {settings.tp_pct:g}%",callback_data="ob_tp"),InlineKeyboardButton(f"🛑 وقف الخسارة {settings.sl_pct:g}%",callback_data="ob_sl")],
-                [InlineKeyboardButton("↩️ رجوع",callback_data="ob_menu")]])
-            await query.edit_message_text("⚙️ إعدادات التداول\nكل عملة لها ميزانيتها الخاصة. لا يوجد فحص شامل للسوق: البوت يتابع العملات التي تضيفها فقط. اضغط إعدادًا ثم أرسل القيمة الجديدة.",reply_markup=kb); return
-        if data == "ob_scan":
-            st=sniper.status(); budgets=st["budgets"]
-            lines=[f"• {sym}: ${budgets.get(sym,0):.2f} | {'يعمل' if sym in st['running_symbols'] else 'متوقف'}" for sym in st["symbols"]]
-            await query.edit_message_text("🪙 العملات التي اخترتها:\n"+("\n".join(lines) or "لا توجد عملات مضافة")+"\n\nلا يتم فحص عملات أخرى تلقائيًا.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ إضافة عملة + ميزانية",callback_data="ob_coin")],[InlineKeyboardButton("📊 إدارة الصفقات",callback_data="ob_manage"),InlineKeyboardButton("↩️ رجوع",callback_data="ob_menu")]])); return
-        if data == "ob_coin":
-            context.user_data["ob_waiting"]="watch_symbol"
-            await query.edit_message_text("أرسل مجموعة العملات في رسالة واحدة، مفصولة بفواصل أو كل عملة في سطر.\nمثال: `GM, ACN, SOL, BTC`\nأو: `GM/USDT، ACN/USDT، SOL/USDT`\nبعد التحقق سأطلب الميزانية العامة للمجموعة وأقسمها بالتساوي على 3 دفعات.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء",callback_data="ob_menu")]]),parse_mode="Markdown"); return
-        if data == "ob_manage":
-            st=sniper.status(); syms=sorted(set(st["positions"]) | set(st["entry_orders"]))
-            rows=[]
-            for sym in syms:
-                rows.append([InlineKeyboardButton(f"🛑 إغلاق {sym} بسعر السوق + إلغاء أمر الدخول",callback_data="ob_close_"+sym.replace("/","~"))])
-            if syms: rows.append([InlineKeyboardButton("🛑 إغلاق الكل وإلغاء أوامر الدخول",callback_data="ob_close_all")])
-            for sym in st["symbols"]:
-                running=sym in st["running_symbols"]
-                rows.append([InlineKeyboardButton(("⏹ إيقاف " if running else "▶️ تشغيل ")+sym,callback_data=("ob_halt_" if running else "ob_run_")+sym.replace("/","~")),InlineKeyboardButton(f"💵 ميزانية ${st['budgets'].get(sym,0):g}",callback_data="ob_budget_"+sym.replace("/","~"))])
-            rows.append([InlineKeyboardButton("➕ إضافة عملة",callback_data="ob_coin"),InlineKeyboardButton("↩️ رجوع",callback_data="ob_menu")])
-            await query.edit_message_text("📊 إدارة الصفقات والعملات\nالإغلاق يلغي أمر الدخول المعلق التابع للاستراتيجية أولًا، ثم يرسل بيع سوق للكمية المملوكة. لا تُلغَ أوامر يدوية غير تابعة لهذه الاستراتيجية.",reply_markup=InlineKeyboardMarkup(rows)); return
-        if data.startswith("ob_budget_"):
-            sym=data[len("ob_budget_"):].replace("~","/").upper()
-            context.user_data["ob_budget_edit_symbol"]=sym
-            context.user_data["ob_waiting"]="symbol_budget_edit"
-            await query.edit_message_text(f"أرسل الميزانية الجديدة لـ {sym} بالدولار USDT (2 دولار على الأقل). الميزانية الجديدة ستُستخدم عند إنشاء أمر دخول جديد.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء",callback_data="ob_manage")]])); return
-        if data.startswith("ob_run_"):
-            sym=data[len("ob_run_"):].replace("~","/").upper()
-            try:
-                sniper.start_symbol(sym,get_mexc())
-                sniper.scan_symbol_now(sym,get_mexc())
-                ws=sniper.status().get("wall_status",{}).get(sym,{})
-                pending=sniper.status().get("entry_orders",{}).get(sym)
-                if pending:
-                    detail=f"تم إنشاء أمر دخول {'محاكي PAPER' if pending.get('paper') else 'على MEXC'} عند {float(pending['price']):.10g} USDT. الجدار: {float(pending.get('wall') or 0):.10g} بقيمة ${float(pending.get('wall_usdt') or 0):.2f}."
-                else:
-                    detail=f"الحالة الحالية: {ws.get('reason','سيؤكد الجدار في القراءة التالية')}"
-                await query.edit_message_text(f"▶️ بدأ تشغيل {sym}.\nالميزانية: ${get_symbol_budgets(tid).get(sym,0):.2f}\n{detail}\nسيواصل البوت التحقق تلقائيًا كل دورتين ثانية.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 إدارة الصفقات",callback_data="ob_manage"),InlineKeyboardButton("🔄 الحالة",callback_data="ob_status")]]))
-            except Exception as e:
-                await query.edit_message_text(f"تعذر تشغيل {sym}: {str(e)[:180]}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("رجوع",callback_data="ob_manage")]]))
-            return
-        if data.startswith("ob_halt_"):
-            sym=data[len("ob_halt_"):].replace("~","/").upper(); sniper.stop_symbol(sym)
-            await query.edit_message_text(f"تم إيقاف مراقبة {sym}. أي مركز أو أمر دخول قائم لم يُغلق تلقائيًا. استخدم إدارة الصفقات للإغلاق.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 إدارة الصفقات",callback_data="ob_manage")]])); return
-        if data == "ob_close":
-            await query.edit_message_text("استخدم زر إدارة الصفقات لاختيار المركز أو الأمر الذي تريد إغلاقه.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 إدارة الصفقات",callback_data="ob_manage")]])); return
-        if data.startswith("ob_close_"):
-            key=data[len("ob_close_"):]
-            symbols=list(set(sniper.positions) | set(sniper.entry_orders)) if key=="all" else [key.replace("~","/").upper()]
-            results=[]
-            for sym in symbols:
-                ok,msg=sniper.close_symbol(sym); results.append(("✅ " if ok else "⚠️ ")+sym+": "+msg)
-            await query.edit_message_text("\n\n".join(results) or "لا توجد مراكز أو أوامر تابعة للاستراتيجية.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 تحديث الإدارة",callback_data="ob_manage"),InlineKeyboardButton("↩️ الرئيسية",callback_data="ob_menu")]])); return
-        if data == "ob_start":
-            try:
-                sniper.start(get_mexc())
-                # Initial immediate pass for each user-selected pair only.
-                for sym in get_ob_settings(tid).watch_symbols.split(","):
-                    sym=sym.strip().upper()
-                    if sym: sniper.scan_symbol_now(sym,get_mexc())
-                await query.edit_message_text("تم تشغيل العملات التي اخترتها فقط. البوت يراقب جدران دفتر الأوامر ويضع أمرًا عند تحقق شروطه.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 إدارة الصفقات",callback_data="ob_manage"),InlineKeyboardButton("الحالة",callback_data="ob_status")]]))
-            except Exception as e:
-                await query.edit_message_text(f"تعذر التشغيل: {e}",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩️ رجوع",callback_data="ob_menu")]]))
-            return
-        if data == "ob_stop":
-            sniper.stop(); await query.edit_message_text("تم إيقاف مراقبة كل العملات. لم يتم إغلاق المراكز تلقائيًا؛ استخدم إدارة الصفقات لإغلاقها.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 إدارة الصفقات",callback_data="ob_manage")]])); return
-        if data == "ob_mode":
-            if settings.mode == "PAPER":
-                update_ob_settings(tid,mode="LIVE",live_confirmed=False)
-                msg="تم اختيار LIVE لكن التنفيذ الحقيقي ما زال مقفولًا حتى تضغط تأكيد LIVE. اختبر PAPER أولًا."
-            else:
-                update_ob_settings(tid,mode="PAPER",live_confirmed=False); msg="تم الرجوع إلى PAPER."
-            await query.edit_message_text(msg,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 الرجوع للاستراتيجية",callback_data="ob_menu")]])); return
-        if data == "ob_arm":
-            if settings.mode != "LIVE":
-                await query.edit_message_text("حوّل الوضع إلى LIVE أولًا، ثم أكد السماح.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("رجوع",callback_data="ob_menu")]])); return
-            update_ob_settings(tid,live_confirmed=True)
-            await query.edit_message_text("تم تأكيد LIVE. راجع الميزانيات لكل عملة قبل التشغيل.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 الحالة",callback_data="ob_menu")]])); return
-        if data in ("ob_size","ob_tp","ob_sl","ob_maxpos","ob_spread","ob_wall","ob_distance","ob_total_budget","ob_dca"):
-            key={"ob_size":"order_usdt","ob_tp":"tp_pct","ob_sl":"sl_pct","ob_maxpos":"max_positions","ob_spread":"max_spread_pct","ob_wall":"wall_multiple","ob_distance":"max_wall_distance_pct","ob_total_budget":"total_budget","ob_dca":"dca_entries"}[data]
-            context.user_data["ob_waiting"]=key
-            label={"order_usdt":"الميزانية الافتراضية بالدولار","total_budget":"الميزانية العامة لكل العملات (0 لإيقاف التقسيم العام)","dca_entries":"عدد دفعات الدخول (1 إلى 3)","tp_pct":"هدف الربح %","sl_pct":"وقف الخسارة %","max_positions":"أقصى عدد للمراكز (1 إلى 20)","max_spread_pct":"أقصى فرق سعر مقبول % (القيمة المناسبة غالبًا 1.2)","wall_multiple":"قوة جدار السيولة مقارنة بالمستويات المجاورة (مثلاً 3 مرات)","max_wall_distance_pct":"أقصى مسافة مقبولة عن الجدار %"}[key]
-            await query.edit_message_text("أرسل "+label+".",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("إلغاء",callback_data="ob_settings")]])); return
-        return
     # توحيد أي زر قديم محفوظ في رسائل Telegram مع شاشة الحيتان الرئيسية.
     if data == "smart_whale_menu":
         data = "whale_reco_menu"
@@ -4728,64 +4483,6 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 
-async def order_book_sniper_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        tid = int(getattr(config, "ADMIN_TELEGRAM_ID", 0) or 0)
-        if not tid:
-            return
-        sniper = get_sniper(tid)
-        # Restore the exchange handle after process restart and keep managing persisted strategy positions.
-        if sniper.exchange is None:
-            client=get_mexc()
-            sniper.exchange=getattr(client,"exchange",client)
-        previous_orders = {sym: str(order.get("id")) for sym, order in sniper.entry_orders.items()}
-        previous_sell_walls = {sym: ws.get("sell_wall_price") for sym, ws in sniper.wall_status.items() if ws.get("state")=="position_open"}
-        await asyncio.to_thread(sniper.scan_once)
-        # Notify only when a new entry order is created, not on every 2-second poll.
-        for sym, order in list(sniper.entry_orders.items()):
-            if previous_orders.get(sym) == str(order.get("id")):
-                continue
-            is_paper = bool(order.get("paper"))
-            mode_label = "محاكاة PAPER فقط، لم يُرسل أمر إلى MEXC" if is_paper else "تم إرسال أمر Limit حقيقي إلى MEXC"
-            try:
-                await context.bot.send_message(
-                    chat_id=tid,
-                    text=(
-                        f"🧱 {'أمر دخول تجريبي' if is_paper else 'تم إرسال أمر دخول'} | {sym}\n"
-                        f"السعر المحدد: {float(order.get('price') or 0):.10g} USDT\n"
-                        f"جدار الشراء: {float(order.get('wall') or 0):.10g} USDT\n"
-                        f"قيمة الجدار: ${float(order.get('wall_usdt') or 0):.2f} | القوة: {float(order.get('wall_multiple') or 0):.1f}x\n"
-                        f"دفعة رقم {int(order.get('dca_index') or 1)} من {int(order.get('dca_total') or 3)} | مبلغ الدفعة: ${float(order.get('budget') or 0):.2f}\n"
-                        f"الحالة: {mode_label}"
-                    ),
-                )
-            except Exception:
-                logger.exception("Could not send Order Book Sniper entry notification")
-        # Notify once when a new or changed sell wall is found for an open position.
-        for sym, position in list(sniper.positions.items()):
-            ws=sniper.wall_status.get(sym,{})
-            sell_price=ws.get("sell_wall_price")
-            old_price=previous_sell_walls.get(sym)
-            if not sell_price or (old_price is not None and abs(float(old_price)-float(sell_price)) < max(abs(float(sell_price))*0.005,1e-12)):
-                continue
-            try:
-                await context.bot.send_message(
-                    chat_id=tid,
-                    text=(
-                        f"🎯 أفضل جدار بيعي بعد الدخول | {sym}\n"
-                        f"سعر الدخول: {float(position.get('entry') or 0):.10g} USDT\n"
-                        f"الجدار البيعي: {float(sell_price):.10g} USDT\n"
-                        f"قيمة الجدار: ${float(ws.get('sell_wall_usdt') or 0):.2f} | القوة: {float(ws.get('sell_wall_multiple') or 0):.1f}x\n"
-                        f"التأكيد: قراءتان متتاليتان\n"
-                        f"الحالة: المركز مفتوح، والهدف يتبع هذا الجدار"
-                    ),
-                )
-            except Exception:
-                logger.exception("Could not send Order Book Sniper sell-wall notification")
-    except Exception:
-        logger.exception("Order Book Sniper scan failed")
-
-
 def main():
     if not config.TELEGRAM_BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN مطلوب")
@@ -4795,31 +4492,11 @@ def main():
         raise SystemExit("DATABASE_URL مطلوب")
 
     init_db()
-    ensure_order_book_schema()
     # Strategy tables are isolated and do not modify portfolio records/models.
-    init_liquidity_db()
     if config.ADMIN_TELEGRAM_ID:
         _load_whale_settings(config.ADMIN_TELEGRAM_ID)
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
     app.bot_data["get_mexc"] = get_mexc
-
-    # Independent Liquidity Swings scan: entry signals + management of strategy-owned positions.
-    if app.job_queue:
-        app.job_queue.run_repeating(
-            liquidity_scan_job,
-            interval=60,
-            first=30,
-            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 30},
-            name="liquidity_swings_spot_scan",
-        )
-        logger.info("Liquidity Swings Spot strategy scheduled (every 60s)")
-
-    if app.job_queue:
-        app.job_queue.run_repeating(
-            order_book_sniper_job, interval=2, first=5,
-            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 5},
-            name="order_book_liquidity_sniper",
-        )
 
     # Cloud monitor for TP/SL every 25 seconds
     if app.job_queue:
