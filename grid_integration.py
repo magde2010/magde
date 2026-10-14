@@ -63,6 +63,35 @@ def _apply_saved(cfg, saved):
     return cfg.validate()
 
 
+def _reset_paper_session(service):
+    """Discard only simulated orders/position; never touch live exchange orders."""
+    if not service.cfg.dry_run:
+        return
+    for order in service.db.open_orders():
+        service.db.update_order(
+            order["client_order_id"],
+            status="canceled",
+            raw_status="paper_reset",
+            last_error="Dry Run session reset before settings/live mode change",
+        )
+    budget = str(service.cfg.total_budget)
+    service.db.update_position(
+        symbol=service.cfg.symbol,
+        grid_reference=None,
+        quantity="0",
+        average_entry="0",
+        cost="0",
+        spent="0",
+        remaining_budget=budget,
+        state="PAUSED",
+        dca4_complete=0,
+        emergency_stop=0,
+        running=0,
+        tp_reference_avg="0",
+    )
+    service.db.event("paper_session_reset", {"reason": "settings_or_live_mode_change"})
+
+
 def get_grid_service():
     global _service, _db, _lock, _error
     if _service is not None:
@@ -112,8 +141,12 @@ def update_grid_setting(field, raw_value):
     if error:
         return False, error
     position = service.db.position()
-    if position.get("running") or service.db.open_orders():
+    if position.get("running"):
         return False, "أوقف Grid أولًا وألغِ/انتظر الأوامر المفتوحة قبل تعديل الإعدادات."
+    if service.cfg.dry_run:
+        _reset_paper_session(service)
+    elif service.db.open_orders():
+        return False, "توجد أوامر LIVE مفتوحة؛ ألغها أو انتظر تنفيذها قبل تعديل الإعدادات."
     try:
         if field == "symbol":
             value = str(raw_value).strip().upper().replace("-", "/")
@@ -142,8 +175,12 @@ def switch_grid_mode(live):
     service, error = get_grid_service()
     if error:
         return False, error
-    if service.db.position().get("running") or service.db.open_orders():
+    if service.db.position().get("running"):
         return False, "أوقف Grid أولًا وتأكد من عدم وجود أوامر مفتوحة."
+    if service.cfg.dry_run:
+        _reset_paper_session(service)
+    elif service.db.open_orders():
+        return False, "توجد أوامر LIVE مفتوحة؛ لا يمكن تبديل الوضع قبل مراجعتها."
     if live and not (os.getenv("MEXC_API_KEY") and os.getenv("MEXC_API_SECRET")):
         return False, "مفاتيح MEXC غير موجودة في بيئة التشغيل. لا ترسلها عبر Telegram."
     payload = _payload(service.cfg)
