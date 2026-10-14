@@ -56,6 +56,16 @@ class ExchangeAdapter:
         if client_order_id: p['clientOrderId']=client_order_id
         # Never automatically retry an order-creation request: a timeout may mean it reached MEXC.
         return self.exchange.create_order(symbol,'limit',side,float(amount),float(price),p)
+    def create_market_order(self,symbol,side,amount,params=None,client_order_id=None):
+        if self.dry_run:
+            return {'id':'paper-'+str(client_order_id), 'clientOrderId':client_order_id,
+                    'status':'closed', 'symbol':symbol, 'side':side,
+                    'type':'market', 'amount':float(amount), 'filled':float(amount),
+                    'cost':0.0, 'price':0.0, 'average':0.0}
+        p=dict(params or {})
+        if client_order_id: p['clientOrderId']=client_order_id
+        # One request only: an unknown response is reconciled by the service.
+        return self.exchange.create_order(symbol,'market',side,float(amount),None,p)
     def cancel_order(self,order_id,symbol):
         if self.dry_run:
             o=self.paper_orders.get(str(order_id));

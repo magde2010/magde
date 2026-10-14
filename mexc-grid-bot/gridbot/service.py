@@ -24,7 +24,7 @@ class TradingService:
     def _new_client_id(self,role,level):
         # A deterministic key for the strategy intent prevents a retry from creating a second order.
         row=self.db.conn.execute('SELECT COALESCE(MAX(id),0)+1 AS n FROM grid_orders').fetchone(); return f'grid-{role[:3]}-{level}-{row["n"]}-{uuid.uuid4().hex[:8]}'
-    def _persist_order(self,role,level,side,price,amount):
+    def _persist_order(self,role,level,side,price,amount,order_type='limit'):
         price,amount=D(price),D(amount)
         if price<=0 or amount<=0: raise ValueError('order price and amount must be positive')
         market=self.exchange.market(self.cfg.symbol); limits=self.exchange.limits(self.cfg.symbol)
@@ -36,7 +36,10 @@ class TradingService:
         row=self.db.insert_order_intent(cid,self.cfg.symbol,role,level,side,price,amount)
         if row['status']!='pending' or row['exchange_order_id']: return row
         try:
-            remote=self.exchange.create_limit_order(self.cfg.symbol,side,amount,price,client_order_id=cid)
+            if order_type == 'market' and hasattr(self.exchange, 'create_market_order'):
+                remote=self.exchange.create_market_order(self.cfg.symbol,side,amount,client_order_id=cid)
+            else:
+                remote=self.exchange.create_limit_order(self.cfg.symbol,side,amount,price,client_order_id=cid)
             self.db.update_order(cid,exchange_order_id=str(remote.get('id')) if remote.get('id') is not None else None,status=remote.get('status') or 'unknown',raw_status=remote.get('status'),filled='0',cost='0',last_error=None)
             saved=self.db.order_by_client_id(cid)
             if D(str(remote.get('filled') or '0'))>0: self._sync_order(saved,remote)
@@ -172,7 +175,10 @@ class TradingService:
         p=self._position()
         if D(p['quantity'])>0 or any(o['role']=='initial' and o['status'] in ACTIVE|TERMINAL for o in self.db.orders()): return
         amount=self.cfg.initial_budget/price
-        self._persist_order('initial',0,'buy',price,amount)
+        # The first LIVE entry must not wait for a limit-price touch. DCA and
+        # TP remain limit orders; only the initial allocation uses market.
+        initial_type = 'market' if not self.cfg.dry_run else 'limit'
+        self._persist_order('initial',0,'buy',price,amount,order_type=initial_type)
     def _ensure_dca(self):
         p=self._position()
         if p['dca4_complete'] or p['emergency_stop'] or p['state']=='FROZEN': return

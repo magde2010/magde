@@ -929,6 +929,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             service.db.update_position(running=1, state="ACTIVE")
             service.db.event("strategy_started", {"by": tid, "source": "portfolio_bot"})
+            try:
+                await service.tick()
+            except Exception as exc:
+                service.last_error = f"{type(exc).__name__}: {exc}"
+                service.db.update_position(state="FROZEN")
+                await query.answer("فشل التشغيل؛ افتح متابعة المستويات لمعرفة الخطأ", show_alert=True)
+                await query.edit_message_text(
+                    f"⚠️ فشل تشغيل Grid\n\n`{type(exc).__name__}: {exc}`",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 متابعة المستويات", callback_data="grid_levels")]]),
+                )
+                return
         elif data == "grid_stop":
             service.db.update_position(running=0, state="PAUSED")
             service.db.event("strategy_paused", {"by": tid, "source": "portfolio_bot"})
