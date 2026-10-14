@@ -879,6 +879,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p = service.db.position()
         state = p.get("state") or "IDLE"
         mode = "DRY RUN" if service.cfg.dry_run else "LIVE"
+        setup_note = "\n⚠️ أكمل اختيار العملة والميزانية من الإعدادات قبل التشغيل." if getattr(service, "needs_setup", False) else ""
         text = (
             "▦ *نظام Grid المستقل*\n\n"
             f"العملة: `{service.cfg.symbol}`\n"
@@ -888,7 +889,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"المنصرف: `{p.get('spent', '0')}` USDT\n"
             f"المتبقي: `{p.get('remaining_budget', '0')}` USDT\n"
             f"المتوسط: `{p.get('average_entry', '0')}`\n\n"
-            "النظام يبدأ متوقفًا. شغّله بعد مراجعة الإعدادات."
+            "النظام يبدأ متوقفًا. شغّله بعد مراجعة الإعدادات." + setup_note
         )
         await query.edit_message_text(
             text,
@@ -924,6 +925,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if data == "grid_run":
             p = service.db.position()
+            if getattr(service, "needs_setup", False):
+                await query.answer("أكمل إعداد العملة والميزانية أولًا", show_alert=True)
+                return
             if p.get("emergency_stop") or p.get("state") == "FROZEN":
                 await query.answer("لا يمكن التشغيل: Emergency Stop أو FROZEN", show_alert=True)
                 return

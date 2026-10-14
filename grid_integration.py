@@ -13,7 +13,7 @@ _lock = None
 _error = None
 
 
-def _payload(cfg):
+def _payload(cfg, setup_complete=True):
     return {
         "symbol": cfg.symbol,
         "total_budget": str(cfg.total_budget),
@@ -25,6 +25,7 @@ def _payload(cfg):
         "recenter_percent": str(cfg.upward_recenter_percent),
         "dry_run": cfg.dry_run,
         "live_enabled": cfg.live_enabled,
+        "setup_complete": bool(setup_complete),
     }
 
 
@@ -112,13 +113,16 @@ def get_grid_service():
         _lock = SingletonLock(os.getenv("GRID_LOCK_PATH", "./data/grid_bot.lock"))
         _lock.acquire()
         _db = GridDB(os.getenv("GRID_DB_PATH", "./data/grid_bot.sqlite3"))
-        cfg = _apply_saved(cfg, _read_saved(_db))
+        saved = _read_saved(_db)
+        cfg = _apply_saved(cfg, saved)
+        setup_complete = bool(saved.get("setup_complete"))
         exchange = ExchangeAdapter(dry_run=cfg.dry_run)
         market = exchange.market(cfg.symbol)
         if not market.get("spot", True):
             raise RuntimeError("Grid يدعم سوق Spot فقط")
-        _db.save_config(_payload(cfg))
+        _db.save_config(_payload(cfg, setup_complete=setup_complete))
         service = TradingService(cfg, _db, exchange)
+        service.needs_setup = not setup_complete
         service.recover()
         _service = service
         return _service, None
@@ -164,7 +168,11 @@ def update_grid_setting(field, raw_value):
         except Exception:
             setattr(service.cfg, attr, previous)
             raise
-        service.db.save_config(_payload(service.cfg))
+        complete = bool(_read_saved(service.db).get("setup_complete"))
+        if service.cfg.symbol != "BTC/USDT" and service.cfg.total_budget != Decimal("100"):
+            complete = True
+        service.db.save_config(_payload(service.cfg, setup_complete=complete))
+        service.needs_setup = not complete
         return True, "تم حفظ الإعداد بنجاح."
     except Exception as exc:
         return False, f"إعداد غير صالح: {exc}"
@@ -175,6 +183,8 @@ def switch_grid_mode(live):
     service, error = get_grid_service()
     if error:
         return False, error
+    if getattr(service, "needs_setup", False):
+        return False, "أكمل إعداد العملة والميزانية من Telegram أولًا؛ لن يتم استخدام BTC/100 الافتراضية."
     if service.db.position().get("running"):
         return False, "أوقف Grid أولًا وتأكد من عدم وجود أوامر مفتوحة."
     if service.cfg.dry_run:
@@ -198,6 +208,8 @@ def switch_grid_mode(live):
 async def grid_monitor_job(context):
     service, error = get_grid_service()
     if service is None:
+        return
+    if getattr(service, "needs_setup", False):
         return
     try:
         await service.tick()
