@@ -699,6 +699,16 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     tid = update.effective_user.id
 
+    grid_field = context.user_data.pop("grid_setting", None)
+    if grid_field:
+        from grid_integration import update_grid_setting
+        ok, message = update_grid_setting(grid_field, text)
+        await update.message.reply_text(
+            ("✅ " if ok else "⚠️ ") + message,
+            reply_markup=main_menu_keyboard() if ok else None,
+        )
+        return
+
     if context.user_data.get("waiting"):
         # تعديل إعدادات المحافظ العامة
         user_field = context.user_data.get("edit_user_tpsl")
@@ -781,6 +791,51 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     data = query.data or ""
     tid = update.effective_user.id
+    if data == "grid_settings":
+        from grid_integration import get_grid_service
+        service, error = get_grid_service()
+        if error:
+            await query.edit_message_text(f"⚠️ {error}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ رجوع", callback_data="grid_menu")]]))
+            return
+        c = service.cfg
+        await query.edit_message_text(
+            "⚙️ *إعدادات Grid*\n\n"
+            f"العملة: `{c.symbol}`\nالميزانية: `{c.total_budget}` USDT\nالدخول الأولي: `{c.initial_pct}%`\n"
+            f"DCA هبوط: `{','.join(map(str, c.dca_drops))}%`\n"
+            f"DCA توزيع: `{','.join(map(str, c.dca_allocations))}%`\n"
+            f"TP أهداف: `{','.join(map(str, c.tp_gains))}%`\n"
+            f"TP بيع: `{','.join(map(str, c.tp_sell_pcts))}%`\n"
+            f"إعادة التمركز: `{c.upward_recenter_percent}%`\n\n"
+            "أوقف Grid قبل تعديل أي إعداد.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("العملة", callback_data="grid_set_symbol"), InlineKeyboardButton("الميزانية", callback_data="grid_set_budget")],
+                [InlineKeyboardButton("الدخول الأولي %", callback_data="grid_set_initial"), InlineKeyboardButton("إعادة التمركز %", callback_data="grid_set_recenter")],
+                [InlineKeyboardButton("هبوط DCA الأربعة", callback_data="grid_set_dca_drops")],
+                [InlineKeyboardButton("توزيع DCA الأربعة", callback_data="grid_set_dca_allocations")],
+                [InlineKeyboardButton("أهداف TP الأربعة", callback_data="grid_set_tp_gains")],
+                [InlineKeyboardButton("نسب بيع TP الأربعة", callback_data="grid_set_tp_sell_pcts")],
+                [InlineKeyboardButton("↩ رجوع إلى Grid", callback_data="grid_menu")],
+            ]),
+        )
+        return
+    if data.startswith("grid_set_"):
+        field = data[len("grid_set_"):]
+        prompts = {
+            "symbol": "أرسل رمز العملة، مثال: BTC/USDT أو ETH/USDT",
+            "budget": "أرسل إجمالي الميزانية بالدولار، مثال: 100",
+            "initial": "أرسل نسبة الدخول الأولي، مثال: 50 (والباقي يذهب إلى DCA)",
+            "recenter": "أرسل نسبة الصعود التي عندها يعاد تمركز الشبكة، مثال: 10",
+            "dca_drops": "أرسل 4 نسب هبوط مفصولة بفواصل، مثال: 2.5,5,7.5,10",
+            "dca_allocations": "أرسل 4 نسب توزيع DCA ومجموعها يجب أن يكون 100، مثال: 20,24,26,30",
+            "tp_gains": "أرسل 4 أهداف ربح مفصولة بفواصل، مثال: 2,4,7,10",
+            "tp_sell_pcts": "أرسل 4 نسب بيع ومجموعها يجب أن يكون 100، مثال: 25,25,25,25 أو 100,0,0,0",
+        }
+        if field not in prompts:
+            return
+        context.user_data["grid_setting"] = field
+        await query.edit_message_text(f"⚙️ {prompts[field]}\n\nاكتب /cancel للإلغاء.")
+        return
     if data == "grid_menu":
         from grid_integration import get_grid_service
         service, error = get_grid_service()
@@ -810,6 +865,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("▶️ تشغيل Grid", callback_data="grid_run"), InlineKeyboardButton("⏸ إيقاف", callback_data="grid_stop")],
                 [InlineKeyboardButton("🛑 إيقاف طوارئ", callback_data="grid_emergency")],
+                [InlineKeyboardButton("⚙️ إعدادات Grid", callback_data="grid_settings")],
                 [InlineKeyboardButton("🔄 تحديث", callback_data="grid_menu"), InlineKeyboardButton("↩ القائمة", callback_data="menu")],
             ]),
         )
@@ -843,6 +899,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("▶️ تشغيل", callback_data="grid_run"), InlineKeyboardButton("⏸ إيقاف", callback_data="grid_stop")],
                 [InlineKeyboardButton("🛑 طوارئ", callback_data="grid_emergency")],
+                [InlineKeyboardButton("⚙️ إعدادات Grid", callback_data="grid_settings")],
                 [InlineKeyboardButton("🔄 تحديث", callback_data="grid_menu"), InlineKeyboardButton("↩ القائمة", callback_data="menu")],
             ]),
         )
