@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS grid_bot_configs (id INTEGER PRIMARY KEY CHECK(id=1), config_json TEXT NOT NULL, updated_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS grid_positions (id INTEGER PRIMARY KEY CHECK(id=1), symbol TEXT NOT NULL, grid_reference TEXT, quantity TEXT NOT NULL DEFAULT '0', average_entry TEXT NOT NULL DEFAULT '0', cost TEXT NOT NULL DEFAULT '0', spent TEXT NOT NULL DEFAULT '0', remaining_budget TEXT NOT NULL DEFAULT '0', state TEXT NOT NULL DEFAULT 'IDLE', dca4_complete INTEGER NOT NULL DEFAULT 0, emergency_stop INTEGER NOT NULL DEFAULT 0, running INTEGER NOT NULL DEFAULT 0, last_recenter_time TEXT, last_3m_candle_ms INTEGER, last_sync_at TEXT, tp_reference_avg TEXT NOT NULL DEFAULT '0');
+CREATE TABLE IF NOT EXISTS grid_positions (id INTEGER PRIMARY KEY CHECK(id=1), symbol TEXT NOT NULL, grid_reference TEXT, quantity TEXT NOT NULL DEFAULT '0', average_entry TEXT NOT NULL DEFAULT '0', cost TEXT NOT NULL DEFAULT '0', spent TEXT NOT NULL DEFAULT '0', remaining_budget TEXT NOT NULL DEFAULT '0', state TEXT NOT NULL DEFAULT 'IDLE', dca4_complete INTEGER NOT NULL DEFAULT 0, emergency_stop INTEGER NOT NULL DEFAULT 0, running INTEGER NOT NULL DEFAULT 0, last_recenter_time TEXT, last_3m_candle_ms INTEGER, last_sync_at TEXT, tp_reference_avg TEXT NOT NULL DEFAULT '0', tp_base_quantity TEXT NOT NULL DEFAULT '0');
 CREATE TABLE IF NOT EXISTS grid_orders (id INTEGER PRIMARY KEY AUTOINCREMENT, client_order_id TEXT NOT NULL UNIQUE, exchange_order_id TEXT, symbol TEXT NOT NULL, role TEXT NOT NULL, level INTEGER NOT NULL, side TEXT NOT NULL, status TEXT NOT NULL, price TEXT, amount TEXT, filled TEXT NOT NULL DEFAULT '0', cost TEXT NOT NULL DEFAULT '0', raw_status TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_error TEXT, accounted_filled TEXT NOT NULL DEFAULT '0', accounted_cost TEXT NOT NULL DEFAULT '0');
 CREATE INDEX IF NOT EXISTS idx_grid_orders_status ON grid_orders(status);
 CREATE INDEX IF NOT EXISTS idx_grid_orders_role ON grid_orders(role,status);
@@ -17,7 +17,7 @@ class GridDB:
         self.conn=sqlite3.connect(str(self.path),timeout=30,isolation_level=None,check_same_thread=False); self.conn.row_factory=sqlite3.Row
         self.conn.execute('PRAGMA journal_mode=WAL'); self.conn.execute('PRAGMA foreign_keys=ON'); self.conn.execute('PRAGMA busy_timeout=30000'); self.conn.executescript(SCHEMA)
         cols={r['name'] for r in self.conn.execute('PRAGMA table_info(grid_positions)')}
-        for name,decl in [('cost',"TEXT NOT NULL DEFAULT '0'"),('emergency_stop','INTEGER NOT NULL DEFAULT 0'),('running','INTEGER NOT NULL DEFAULT 0'),('last_sync_at','TEXT'),('tp_reference_avg',"TEXT NOT NULL DEFAULT '0'")]:
+        for name,decl in [('cost',"TEXT NOT NULL DEFAULT '0'"),('emergency_stop','INTEGER NOT NULL DEFAULT 0'),('running','INTEGER NOT NULL DEFAULT 0'),('last_sync_at','TEXT'),('tp_reference_avg',"TEXT NOT NULL DEFAULT '0'"),('tp_base_quantity',"TEXT NOT NULL DEFAULT '0'")]:
             if name not in cols: self.conn.execute(f'ALTER TABLE grid_positions ADD COLUMN {name} {decl}')
         ocols={r['name'] for r in self.conn.execute('PRAGMA table_info(grid_orders)')}
         if 'last_error' not in ocols: self.conn.execute('ALTER TABLE grid_orders ADD COLUMN last_error TEXT')

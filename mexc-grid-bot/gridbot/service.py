@@ -52,7 +52,7 @@ class TradingService:
         self.db.update_position(
             symbol=self.cfg.symbol, quantity=str(quantity), cost=str(cost), average_entry=str(average),
             spent=str(cost), remaining_budget=str(max(D('0'),self.cfg.total_budget-cost)),
-            grid_reference=str(average), state='ACTIVE', dca4_complete=1 if cost>=self.cfg.total_budget else 0,
+            grid_reference=str(average), tp_base_quantity=str(quantity), state='ACTIVE', dca4_complete=1 if cost>=self.cfg.total_budget else 0,
         )
         self.db.event('existing_position_adopted', {'symbol':self.cfg.symbol,'quantity':str(quantity),'average_entry':str(average),'cost':str(cost)})
         return True
@@ -147,6 +147,8 @@ class TradingService:
                     accounting.add_fill(delta_q,avg,incremental_cost)
                     dca4_done=bool(self._position()['dca4_complete']) or (local['role']=='dca' and int(local['level'])==4)
                     self._save_accounting(accounting,state='DEFENSIVE' if dca4_done else 'ACTIVE',dca4_complete=1 if dca4_done else 0)
+                    base=D(self._position().get('tp_base_quantity') or '0')+delta_q
+                    self.db.update_position(tp_base_quantity=str(base))
                     self.db.event('buy_fill',{'role':local['role'],'level':local['level'],'quantity':delta_q,'average_entry':accounting.average_entry})
                 else:
                     if delta_q > accounting.quantity:
@@ -204,10 +206,17 @@ class TradingService:
         p=self._accounting()
         if p.quantity<=0 or p.average_entry<=0:
             self.db.update_position(tp_reference_avg='0'); return
+        position=self._position()
+        base=D(position.get('tp_base_quantity') or '0')
+        if base<=0:
+            base=p.quantity
+            self.db.update_position(tp_base_quantity=str(base))
+        sold_by_level={i:sum((D(o.get('filled') or '0') for o in self.db.orders() if o['role']=='tp' and int(o['level'])==i),D('0')) for i in range(1,5)}
         remaining=p.quantity
         for i,(gain,pct) in enumerate(zip(self.cfg.tp_gains,self.cfg.tp_sell_pcts),1):
             if pct<=0: continue
-            amount=p.quantity*pct/D('100') if i<4 else remaining
+            target=base*pct/D('100') if i<4 else max(D('0'),base-sum((base*x/D('100') for x in self.cfg.tp_sell_pcts[:3]),D('0')))
+            amount=max(D('0'),target-sold_by_level[i])
             amount=min(amount,remaining); remaining-=amount
             if amount<=0: continue
             price=p.average_entry*(D('1')+gain/D('100'))
