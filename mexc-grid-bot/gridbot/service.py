@@ -221,18 +221,28 @@ class TradingService:
         if p['dca4_complete'] or p['emergency_stop'] or p['state']=='FROZEN': return
         reference=D(p['grid_reference'] or '0')
         if reference<=0: return
-        budgets=dca_quote_budgets(self.cfg); prices=dca_prices(reference,self.cfg)
+        base_budgets=dca_quote_budgets(self.cfg); prices=dca_prices(reference,self.cfg)
+        # Existing/adopted positions may already consume part of the total
+        # budget. Scale the four DCA allocations to the real remaining amount.
+        available_total=max(D('0'), self.cfg.total_budget-D(p['spent']))
+        available_dca=min(self.cfg.dca_budget, available_total)
+        scale=(available_dca/self.cfg.dca_budget) if self.cfg.dca_budget>0 else D('0')
+        budgets=[b*scale for b in base_budgets]
         all_orders=self.db.orders()
         for i,(budget,price) in enumerate(zip(budgets,prices),1):
             if budget<=0: continue
             existing=[o for o in all_orders if o['role']=='dca' and int(o['level'])==i and o['status'] not in ('canceled','rejected','expired')]
             if existing: continue
-            all_dca=[o for o in all_orders if o['role']=='dca']
+            all_dca=[o for o in all_orders if o['role']=='dca' and o['status'] not in ('canceled','rejected','expired')]
             dca_spent=sum((D(o.get('cost') or '0') for o in all_dca),D('0'))
             dca_reserved=sum((max(D('0'),D(o['amount'])-D(o.get('filled') or '0'))*D(o['price']) for o in self.db.open_orders() if o['role']=='dca'),D('0'))
-            if dca_spent+dca_reserved+budget>self.cfg.dca_budget: raise RuntimeError('DCA order would exceed its dedicated DCA budget')
+            if dca_spent+dca_reserved+budget>available_dca:
+                self.db.event('dca_skipped_budget',{'level':i,'requested':str(budget),'remaining':str(max(D('0'),available_dca-dca_spent-dca_reserved))})
+                continue
             spent=D(p['spent']); reserved=sum((max(D('0'),D(o['amount'])-D(o.get('filled') or '0'))*D(o['price']) for o in self.db.open_orders() if o['side']=='buy'),D('0'))
-            if spent+reserved+budget>self.cfg.total_budget: raise RuntimeError('DCA order would exceed total budget')
+            if spent+reserved+budget>self.cfg.total_budget:
+                self.db.event('dca_skipped_total_budget',{'level':i,'requested':str(budget)})
+                continue
             self._persist_order('dca',i,'buy',price,budget/price)
     def _recenter(self,candles,now):
         if len(candles)<2: return
