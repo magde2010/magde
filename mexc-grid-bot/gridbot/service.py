@@ -246,7 +246,25 @@ class TradingService:
                 self.last_error=f'{type(exc).__name__}: {exc}'; log.exception('Grid monitor iteration failed')
             await asyncio.sleep(self.cfg.poll_seconds)
     def status_text(self):
-        p=self._position(); orders=self.db.orders(); active=[o for o in orders if o['status'] in ACTIVE]
-        dca=' | '.join(f"L{i}:{next((o['status'] for o in reversed(orders) if o['role']=='dca' and int(o['level'])==i), 'غير منشأ')}" for i in range(1,5))
-        tp=' | '.join(f"TP{i}:{next((o['status'] for o in reversed(orders) if o['role']=='tp' and int(o['level'])==i), 'غير منشأ')}" for i in range(1,5))
-        return (f"الرمز: {self.cfg.symbol}\nالسعر الحالي: {self.last_price or 'غير متاح'}\nمتوسط الدخول: {p['average_entry']}\nالكمية: {p['quantity']}\nالمبلغ المصروف: {p['spent']} USDT\nالمتبقي من الميزانية: {p['remaining_budget']} USDT\nحالات DCA: {dca}\nحالات TP: {tp}\nالأوامر المفتوحة: {len(active)}\nآخر مزامنة: {p['last_sync_at'] or 'لم تتم'}\nالوضع: {'DRY RUN' if self.cfg.dry_run else 'LIVE'} / {p['state']}\nEmergency Stop: {'مفعل' if p['emergency_stop'] else 'لا'}\nآخر خطأ: {self.last_error or 'لا يوجد'}")
+        p=self._position(); orders=self.db.orders()
+        labels={'open':'مفتوح','partially_filled':'منفذ جزئي','closed':'تم','canceled':'ملغى','pending':'جاري','unknown':'مراجعة','cancel_pending':'إلغاء','rejected':'مرفوض','expired':'منتهي'}
+        def row(role, level):
+            order=next((o for o in reversed(orders) if o['role']==role and int(o['level'])==level), None)
+            if not order: return 'غير جاهز'
+            status=labels.get(order['status'], order['status'])
+            price=order.get('price') or '-'
+            return f'{status} — {price}$'
+        mode='حقيقي' if not self.cfg.dry_run else 'تجريبي'
+        state={'ACTIVE':'يعمل','PAUSED':'متوقف','IDLE':'جاهز','DEFENSIVE':'وضع دفاعي','FROZEN':'متجمد','EMERGENCY_STOP':'طوارئ'}.get(p['state'],p['state'])
+        error='\n⚠️ يوجد خطأ — أرسل صورة هذه الشاشة للمراجعة.' if self.last_error else ''
+        return (f"الحالة: {state} ({mode})\n"
+                f"العملة: {self.cfg.symbol}\n"
+                f"السعر الآن: {self.last_price or '-'}$\n"
+                f"الميزانية: {self.cfg.total_budget} USDT\n"
+                f"المستخدم: {p['spent']} USDT\n"
+                f"متوسط الشراء: {p['average_entry'] or '-'}\n\n"
+                f"🟦 الشراء عند الهبوط\n"
+                f"1) {row('dca',1)}\n2) {row('dca',2)}\n3) {row('dca',3)}\n4) {row('dca',4)}\n\n"
+                f"🟩 البيع عند الصعود\n"
+                f"1) {row('tp',1)}\n2) {row('tp',2)}\n3) {row('tp',3)}\n4) {row('tp',4)}\n"
+                f"{error}")
