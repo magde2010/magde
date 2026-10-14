@@ -30,6 +30,9 @@ def _payload(cfg, setup_complete=True):
 
 
 def _read_saved(db):
+    persistent = _persistent_read()
+    if persistent:
+        return persistent
     row = db.conn.execute("SELECT config_json FROM grid_bot_configs WHERE id=1").fetchone()
     if not row:
         return {}
@@ -37,6 +40,45 @@ def _read_saved(db):
         return json.loads(row[0])
     except Exception:
         return {}
+
+
+def _persistent_read():
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        return {}
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    try:
+        from sqlalchemy import create_engine, text
+        engine = create_engine(url, pool_pre_ping=True)
+        with engine.begin() as conn:
+            conn.execute(text("CREATE TABLE IF NOT EXISTS lotfe_grid_settings (id INTEGER PRIMARY KEY, config_json TEXT NOT NULL)"))
+            row = conn.execute(text("SELECT config_json FROM lotfe_grid_settings WHERE id=1")).fetchone()
+        engine.dispose()
+        return json.loads(row[0]) if row else {}
+    except Exception as exc:
+        log.warning("Persistent Grid settings unavailable: %s", type(exc).__name__)
+        return {}
+
+
+def _persistent_save(payload):
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        return False
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+    try:
+        from sqlalchemy import create_engine, text
+        engine = create_engine(url, pool_pre_ping=True)
+        with engine.begin() as conn:
+            conn.execute(text("CREATE TABLE IF NOT EXISTS lotfe_grid_settings (id INTEGER PRIMARY KEY, config_json TEXT NOT NULL)"))
+            conn.execute(text("DELETE FROM lotfe_grid_settings WHERE id=1"))
+            conn.execute(text("INSERT INTO lotfe_grid_settings (id, config_json) VALUES (1, :config)"), {"config": json.dumps(payload, default=str)})
+        engine.dispose()
+        return True
+    except Exception as exc:
+        log.error("Could not persist Grid settings: %s", type(exc).__name__)
+        return False
 
 
 def _apply_saved(cfg, saved):
@@ -120,7 +162,9 @@ def get_grid_service():
         market = exchange.market(cfg.symbol)
         if not market.get("spot", True):
             raise RuntimeError("Grid يدعم سوق Spot فقط")
-        _db.save_config(_payload(cfg, setup_complete=setup_complete))
+        payload = _payload(cfg, setup_complete=setup_complete)
+        _db.save_config(payload)
+        _persistent_save(payload)
         service = TradingService(cfg, _db, exchange)
         service.needs_setup = not setup_complete
         if setup_complete:
@@ -177,7 +221,9 @@ def update_grid_setting(field, raw_value):
         complete = bool(_read_saved(service.db).get("setup_complete"))
         if service.cfg.symbol != "BTC/USDT" and service.cfg.total_budget != Decimal("100"):
             complete = True
-        service.db.save_config(_payload(service.cfg, setup_complete=complete))
+        payload = _payload(service.cfg, setup_complete=complete)
+        service.db.save_config(payload)
+        _persistent_save(payload)
         service.needs_setup = not complete
         return True, "تم حفظ الإعداد بنجاح."
     except Exception as exc:
@@ -203,6 +249,7 @@ def switch_grid_mode(live):
     payload["dry_run"] = not live
     payload["live_enabled"] = bool(live)
     service.db.save_config(payload)
+    _persistent_save(payload)
     grid_shutdown()
     fresh, fresh_error = get_grid_service()
     if fresh_error:
