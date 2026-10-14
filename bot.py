@@ -3406,8 +3406,21 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
         cloud_tp_actions = await loop.run_in_executor(
             None, lambda: reb.sync_cloud_tp(positions)
         )
+        # Cloud TP changes the same position that the price/SL pass reads.
+        # Exclude those coins from this cycle's stale snapshot to prevent a
+        # just-filled TP from immediately triggering a second market sell.
+        cloud_handled_ids = {
+            action.get("coin_id")
+            for action in cloud_tp_actions
+            if action.get("coin_id") is not None
+            and action.get("action") in {"tp1_hit", "tp2_hit", "tp3_hit", "tp_full_close"}
+        }
+        price_positions = [
+            position for position in positions
+            if getattr(position, "id", None) not in cloud_handled_ids
+        ]
         price_actions = await loop.run_in_executor(
-            None, lambda: reb.check_and_manage_positions(positions)
+            None, lambda: reb.check_and_manage_positions(price_positions)
         )
         actions = cloud_tp_actions + price_actions
         if actions:
@@ -3733,6 +3746,34 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                         await context.bot.send_message(tid, msg, parse_mode="Markdown")
                     except Exception:
                         pass
+
+            elif act["action"] == "sl_sell_partial":
+                filled_amount = float(act.get("filled_amount") or 0)
+                remaining_amount = float(act.get("remaining_amount") or 0)
+                exit_price = float(act.get("price") or 0)
+                entry_price = float(coin.entry_price or 0)
+                if filled_amount > 0:
+                    record_trade_event(
+                        db, tid, pf.id, coin.id, symbol, "stop_loss_partial",
+                        entry_price, exit_price,
+                        filled_amount,
+                        (exit_price - entry_price) * filled_amount,
+                        details="Stop loss partially filled; remaining amount is retried",
+                    )
+                update_coin_position(
+                    db, coin.id,
+                    position_status="open",
+                    remaining_amount=remaining_amount,
+                    current_sl_price=float(act.get("sl") or coin.current_sl_price or 0),
+                )
+                try:
+                    await context.bot.send_message(
+                        tid,
+                        f"⚠️ تنفيذ جزئي للاستوب `{symbol}`: تم بيع `{filled_amount:.8g}`، "
+                        f"المتبقي `{remaining_amount:.8g}` — ستتم إعادة المحاولة دون تصفير المركز.",
+                    )
+                except Exception:
+                    pass
 
             elif act["action"] == "sl_hit_sold":
                 exit_price = float(act.get("price") or 0)
