@@ -4,6 +4,7 @@
 """
 import logging
 import asyncio
+import time
 from typing import Optional, Dict
 from datetime import datetime, timedelta
 
@@ -35,6 +36,8 @@ from mexc_client import MexcClient
 from rebalancer import Rebalancer
 import ui_theme as ui
 from portfolio_controls import calculate_portfolio_entry_budget, calculate_safe_trim_amount, calculate_outstanding_trim_amounts
+
+_SL_FAILURE_ALERTS = {}
 
 
 def _redact_secrets(value: str) -> str:
@@ -3794,6 +3797,11 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     pass
 
             elif act["action"] == "sl_sell_failed":
+                alert_key=(tid, getattr(act, "coin_id", None) if not isinstance(act, dict) else act.get("coin_id"), symbol)
+                now=time.time()
+                if now-_SL_FAILURE_ALERTS.get(alert_key, 0) < 60:
+                    continue
+                _SL_FAILURE_ALERTS[alert_key]=now
                 try:
                     await context.bot.send_message(
                         tid,

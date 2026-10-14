@@ -588,20 +588,44 @@ class Rebalancer:
                 try:
                     # Cancel only TP orders belonging to this tracked position.
                     # Never cancel another portfolio's sell order for the same symbol.
+                    tracked_tp_ids = set()
                     for key in ("tp_order_id", "tp1_order_id", "tp2_order_id", "tp3_order_id"):
                         order_id = getattr(coin, key, None)
                         if order_id:
+                            tracked_tp_ids.add(str(order_id))
                             self.client.cancel_order(
                                 str(order_id), f"{symbol}/{self.quote}", strict=False
                             )
-                    remaining_sells = self.client.fetch_open_sell_orders(symbol)
+                    import time as _time
+                    remaining_sells = []
+                    # MEXC can acknowledge cancellation before the order
+                    # disappears from fetch_open_orders. Poll and retry only
+                    # orders tracked by this position; never cancel another
+                    # strategy's sell order for the same asset.
+                    for attempt in range(4):
+                        _time.sleep(0.8)
+                        remaining_sells = self.client.fetch_open_sell_orders(symbol)
+                        if not remaining_sells:
+                            break
+                        unknown = [
+                            order for order in remaining_sells
+                            if str(order.get("id") or "") not in tracked_tp_ids
+                        ]
+                        if unknown:
+                            ids = [str(order.get("id") or "?") for order in unknown[:5]]
+                            raise RuntimeError(
+                                f"Open sell orders remain that are not tracked by this position: {', '.join(ids)}"
+                            )
+                        if attempt < 3:
+                            for order in remaining_sells:
+                                self.client.cancel_order(
+                                    str(order.get("id")), f"{symbol}/{self.quote}", strict=False
+                                )
                     if remaining_sells:
                         ids = [str(order.get("id") or "?") for order in remaining_sells[:5]]
                         raise RuntimeError(
-                            f"Open sell orders remain after TP cancellation: {', '.join(ids)}"
+                            f"Open tracked sell orders remain after repeated TP cancellation: {', '.join(ids)}"
                         )
-                    import time as _time
-                    _time.sleep(0.8)
                     free_after_cancel = float(self.client.get_free_amount(symbol) or 0.0)
                 except Exception as exc:
                     actions.append({
