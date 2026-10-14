@@ -463,6 +463,41 @@ class Rebalancer:
             })
         return actions
 
+    def sync_cloud_tp(self, positions: List[Any]) -> List[Dict]:
+        """Trigger configured TP targets locally, then market-sell the slice."""
+        actions = []
+        active = [c for c in positions if (c.position_status or "open") in ("open", "tp1_hit")]
+        if not active:
+            return actions
+        prices = self.client.get_all_prices(list({c.symbol for c in active})) or {}
+        for coin in active:
+            status = str(coin.position_status or "open")
+            if status == "open":
+                stage, target, sell_pct = "tp1", float(coin.tp1_price or 0), float(coin.tp1_sell_pct or 0)
+            else:
+                stage, target, sell_pct = "tp2", float(coin.tp2_price or 0), float(coin.tp2_sell_pct or 0)
+            price = float(prices.get(coin.symbol) or prices.get(f"{coin.symbol}/{self.quote}") or 0)
+            if target <= 0 or sell_pct <= 0 or price < target:
+                continue
+            remaining = max(0.0, float(coin.remaining_amount or coin.amount or 0))
+            original = max(remaining, float(coin.amount or 0))
+            amount = min(remaining, original * sell_pct / 100.0)
+            if amount <= 0:
+                continue
+            try:
+                order = self.client.create_market_order(f"{coin.symbol}/{self.quote}", "sell", amount)
+                if not order:
+                    raise RuntimeError("Exchange rejected the cloud TP amount")
+                fill_price = float(order.get("average") or order.get("price") or price)
+                self._confirm_market_sell(f"{coin.symbol}/{self.quote}", order, amount)
+                actions.append({"coin_id": getattr(coin, "id", None), "symbol": coin.symbol,
+                                "action": f"{stage}_hit", "price": fill_price, "fill_price": fill_price,
+                                "filled_amount": amount, "new_sl": float(coin.current_sl_price or 0),
+                                "enable_trail": stage == "tp2", "cloud_tp": True})
+            except Exception as exc:
+                logger.warning("cloud TP failed %s %s: %s", coin.symbol, stage, exc)
+        return actions
+
     def check_and_manage_positions(self, positions: List[Any]) -> List[Dict]:
         """وقف متحرك + إعادة دخول متكررة (بدون أهداف ثابتة).
 
@@ -820,7 +855,7 @@ class Rebalancer:
                 "symbol": symbol,
                 "amount": amount,
                 "entry_price": entry,
-                "place_exchange_orders": True,
+                "place_exchange_orders": False,
             }],
             tp1_pct, tp2_pct, tp3_pct, stop_loss_pct, tp1_sell_pct, tp2_sell_pct,
             control_mode=control_mode,

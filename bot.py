@@ -1637,7 +1637,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
                         "symbol": coin.symbol,
                         "amount": use_amt,
                         "entry_price": entry,
-                        "place_exchange_orders": True,
+                        "place_exchange_orders": False,
                     }],
                     use_tp1, use_tp2, use_tp3, use_sl, s1, s2,
                     control_mode="manual",
@@ -2294,7 +2294,7 @@ async def _do_start(query, tid, pf_id, entry_pct=100):
                 "symbol": c.symbol,
                 "amount": amount,
                 "entry_price": price,
-                "place_exchange_orders": True,
+                "place_exchange_orders": False,
             })
 
         tp_results = get_reb().place_tp_orders(
@@ -2412,7 +2412,7 @@ async def _do_trim_holdings(query, tid, pf_id, pct):
                 tp_res = await loop.run_in_executor(
                     None,
                     lambda s=coin_obj.symbol, a=amount, e=reference_price: get_reb().place_tp_orders(
-                        [{"symbol": s, "amount": a, "entry_price": e, "place_exchange_orders": True}],
+                        [{"symbol": s, "amount": a, "entry_price": e, "place_exchange_orders": False}],
                         tp1, tp2, tp3, sl_pct, sell1, sell2, control_mode="manual",
                     ),
                 )
@@ -2686,7 +2686,7 @@ async def _do_restore_trimmed(query, tid, pf_id, pct):
                 tp_res = await loop.run_in_executor(
                     None,
                     lambda s=coin_obj.symbol, a=amount, e=reference_price: get_reb().place_tp_orders(
-                        [{"symbol": s, "amount": a, "entry_price": e, "place_exchange_orders": True}],
+                        [{"symbol": s, "amount": a, "entry_price": e, "place_exchange_orders": False}],
                         tp1, tp2, tp3, sl_pct, sell1, sell2, control_mode="manual",
                     ),
                 )
@@ -3404,13 +3404,13 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
         # Run sync CCXT work off the event loop so Telegram stays responsive
         loop = asyncio.get_event_loop()
         reb = get_reb()
-        exchange_tp_actions = await loop.run_in_executor(
-            None, lambda: reb.sync_manual_tp_orders(positions)
+        cloud_tp_actions = await loop.run_in_executor(
+            None, lambda: reb.sync_cloud_tp(positions)
         )
         price_actions = await loop.run_in_executor(
             None, lambda: reb.check_and_manage_positions(positions)
         )
-        actions = exchange_tp_actions + price_actions
+        actions = cloud_tp_actions + price_actions
         if actions:
             logger.info(
                 "[MONITOR] actions=%s types=%s",
