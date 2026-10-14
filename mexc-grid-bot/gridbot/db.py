@@ -47,3 +47,7 @@ class GridDB:
     def update_order(self,cid,**kw):
         kw['updated_at']=now(); sql=', '.join(f'{k}=?' for k in kw); self.conn.execute(f'UPDATE grid_orders SET {sql} WHERE client_order_id=?',(*kw.values(),cid))
     def close(self): self.conn.close()
+    def reset_strategy_orders(self):
+        self.conn.execute('DELETE FROM grid_orders')
+        self.conn.execute('DELETE FROM grid_events')
+        self.conn.execute("UPDATE grid_positions SET grid_reference=NULL,quantity='0',average_entry='0',cost='0',spent='0',remaining_budget='0',state='PAUSED',dca4_complete=0,emergency_stop=0,running=0,last_recenter_time=NULL,last_3m_candle_ms=NULL,tp_reference_avg='0',tp_base_quantity='0' WHERE id=1")

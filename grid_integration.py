@@ -315,6 +315,48 @@ def replace_grid_orders():
         return False, f"تعذر إعادة البناء بأمان: {type(exc).__name__}: {exc}"
 
 
+def restart_grid_strategy():
+    """Reset Grid bookkeeping, keep the exchange holdings, and rebuild the strategy."""
+    service, error = get_grid_service()
+    if error:
+        return False, error
+    if getattr(service, "needs_setup", False):
+        return False, "أكمل إعداد العملة والميزانية أولًا."
+    if service.cfg.dry_run:
+        return False, "إعادة التشغيل العامة متاحة في LIVE فقط."
+    try:
+        service.db.update_position(running=0, state='PAUSED')
+        from gridbot.recovery import client_id
+        remote = list(service.exchange.fetch_open_orders(service.cfg.symbol) or [])
+        canceled = 0
+        for order in remote:
+            cid = str(client_id(order) or '')
+            if not cid.startswith('grid-'):
+                continue
+            oid = order.get('id')
+            if not oid:
+                raise RuntimeError('أمر Grid بلا رقم؛ تم الإيقاف دون إعادة تشغيل')
+            service.exchange.cancel_order(oid, service.cfg.symbol)
+            checked = service.exchange.fetch_order(oid, service.cfg.symbol)
+            status = str((checked or {}).get('status','')).lower()
+            if status not in ('canceled','cancelled','closed','rejected','expired'):
+                raise RuntimeError(f'لم يتم تأكيد إلغاء الأمر {oid}')
+            canceled += 1
+        service.db.reset_strategy_orders()
+        adopted = service._adopt_existing_position()
+        if not adopted:
+            service.db.update_position(symbol=service.cfg.symbol, state='PAUSED', running=0)
+        if service._position()['quantity'] and service._position()['state'] != 'FROZEN':
+            service._rebuild_tps()
+        service.db.update_position(running=1, state='ACTIVE')
+        service._ensure_dca()
+        return True, f"تمت إعادة تشغيل Grid من الصفر بنفس الإعدادات. أُلغي {canceled} أمرًا، وتم الحفاظ على الرصيد الحالي وبناء TP/DCA حسب الميزانية."
+    except Exception as exc:
+        service.last_error = f"{type(exc).__name__}: {exc}"
+        service.db.update_position(state='FROZEN', running=0)
+        return False, f"تعذر إعادة التشغيل بأمان: {type(exc).__name__}: {exc}"
+
+
 async def grid_monitor_job(context):
     service, error = get_grid_service()
     if service is None:
