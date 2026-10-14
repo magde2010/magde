@@ -265,6 +265,32 @@ def switch_grid_mode(live):
     return True, "تم التحويل إلى LIVE وإعادة تحميل الاتصال. Grid ما زال متوقفًا؛ اضغط تشغيل Grid عند استعدادك." if live else "تم الرجوع إلى DRY RUN."
 
 
+def replace_grid_orders():
+    """Cancel only this Grid strategy's orders, then rebuild from current holdings."""
+    service, error = get_grid_service()
+    if error:
+        return False, error
+    if getattr(service, "needs_setup", False):
+        return False, "أكمل إعداد العملة والميزانية أولًا."
+    if service.cfg.dry_run:
+        return False, "Grid ليس في وضع LIVE."
+    try:
+        before = len(service.db.open_orders())
+        service._cancel_owned({'initial', 'dca', 'tp'})
+        service.db.update_position(running=0, state='PAUSED', emergency_stop=0)
+        service._adopt_existing_position()
+        if service._position()['state'] != 'FROZEN':
+            service._rebuild_tps()
+            service._ensure_dca()
+            service.db.update_position(state='PAUSED', running=0)
+        after = len(service.db.open_orders())
+        return True, f"تم إلغاء {before} أمر Grid وإعادة بناء {after} أمرًا للعملة {service.cfg.symbol}. المركز والرصيد لم يُباعا."
+    except Exception as exc:
+        service.last_error = f"{type(exc).__name__}: {exc}"
+        service.db.update_position(state='FROZEN', running=0)
+        return False, f"تعذر إعادة البناء بأمان: {type(exc).__name__}: {exc}"
+
+
 async def grid_monitor_job(context):
     service, error = get_grid_service()
     if service is None:

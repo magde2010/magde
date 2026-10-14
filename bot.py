@@ -898,6 +898,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("▶️ تشغيل Grid", callback_data="grid_run"), InlineKeyboardButton("⏸ إيقاف", callback_data="grid_stop")],
                 [InlineKeyboardButton("🛑 إيقاف طوارئ", callback_data="grid_emergency")],
                 [InlineKeyboardButton("📊 متابعة المستويات", callback_data="grid_levels")],
+                [InlineKeyboardButton("♻️ إلغاء الأوامر وبناء الجديد", callback_data="grid_replace_confirm")],
                 [InlineKeyboardButton("⚙️ إعدادات Grid", callback_data="grid_settings")],
                 [InlineKeyboardButton("🔄 تحديث", callback_data="grid_menu"), InlineKeyboardButton("↩ القائمة", callback_data="menu")],
             ]),
@@ -915,6 +916,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🔄 تحديث", callback_data="grid_levels")],
                 [InlineKeyboardButton("⚙️ الإعدادات", callback_data="grid_settings"), InlineKeyboardButton("↩ Grid", callback_data="grid_menu")],
             ]),
+        )
+        return
+    if data == "grid_replace_confirm":
+        from grid_integration import get_grid_service
+        service, error = get_grid_service()
+        if error:
+            await query.edit_message_text(f"⚠️ {error}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Grid", callback_data="grid_menu")]]))
+            return
+        await query.edit_message_text(
+            "⚠️ *إعادة بناء أوامر Grid*\n\n"
+            f"العملة المتأثرة فقط: `{service.cfg.symbol}`\n"
+            "سيتم إلغاء أوامر Grid المفتوحة لهذه العملة، ثم بناء DCA وTP الجديدين حسب الإعدادات والميزانية.\n"
+            "لن يتم بيع المركز ولن يتم لمس نظام المحافظ.\n\nهل تريد التنفيذ؟",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ نفذ الآن", callback_data="grid_replace_execute")],
+                [InlineKeyboardButton("إلغاء", callback_data="grid_menu")],
+            ]),
+        )
+        return
+    if data == "grid_replace_execute":
+        from grid_integration import replace_grid_orders
+        ok, message = replace_grid_orders()
+        await query.edit_message_text(
+            ("✅ " if ok else "⚠️ ") + message,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 متابعة المستويات", callback_data="grid_levels"), InlineKeyboardButton("↩ Grid", callback_data="grid_menu")]]),
         )
         return
     if data in {"grid_run", "grid_stop", "grid_emergency"}:
