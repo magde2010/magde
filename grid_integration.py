@@ -123,7 +123,13 @@ def get_grid_service():
         _db.save_config(_payload(cfg, setup_complete=setup_complete))
         service = TradingService(cfg, _db, exchange)
         service.needs_setup = not setup_complete
-        service.recover()
+        if setup_complete:
+            service.recover()
+        else:
+            # Never inspect or trade the environment defaults (BTC/100) before
+            # the user explicitly saves the symbol and budget in Telegram.
+            service.recovered = True
+            _db.update_position(state='PAUSED', running=0)
         _service = service
         return _service, None
     except Exception as exc:

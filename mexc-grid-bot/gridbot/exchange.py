@@ -74,6 +74,12 @@ class ExchangeAdapter:
         # Cancellation is also sent once; a timeout is reconciled by order ID on the next poll.
         return self.exchange.cancel_order(order_id,symbol)
     def ticker(self,symbol): return self._call(self.exchange.fetch_ticker,symbol)
+    def fetch_balance(self):
+        if self.dry_run: return {'free': {}, 'used': {}, 'total': {}}
+        return self._call(self.exchange.fetch_balance)
+    def fetch_my_trades(self,symbol,limit=200):
+        if self.dry_run or not self.exchange.has.get('fetchMyTrades'): return []
+        return self._call(self.exchange.fetch_my_trades,symbol,None,limit) or []
     def simulate_fills(self,symbol,last_price):
         if not self.dry_run: return []
         filled=[]; p=Decimal(str(last_price))

@@ -21,6 +21,41 @@ class TradingService:
         p=self._position(); return Position(p['quantity'],p['cost'],p['spent'])
     def _save_accounting(self,accounting,**extra):
         self.db.update_position(quantity=str(accounting.quantity),cost=str(accounting.cost),average_entry=str(accounting.average_entry),spent=str(accounting.spent),remaining_budget=str(max(D('0'),self.cfg.total_budget-accounting.spent)),**extra)
+    def _adopt_existing_position(self):
+        """Adopt an existing spot balance instead of buying the initial slice again."""
+        if self.cfg.dry_run or not hasattr(self.exchange, 'fetch_balance'):
+            return False
+        p=self._position()
+        if D(p['quantity']) > 0 or any(o['role']=='initial' and o['status'] in ACTIVE|TERMINAL for o in self.db.orders()):
+            return False
+        base=self.cfg.symbol.split('/')[0]
+        balance=self.exchange.fetch_balance() or {}
+        total=(balance.get('total') or {}).get(base)
+        if total is None:
+            free=D(str((balance.get('free') or {}).get(base, '0') or '0'))
+            used=D(str((balance.get('used') or {}).get(base, '0') or '0'))
+            total=free+used
+        quantity=D(str(total or '0'))
+        if quantity <= 0:
+            return False
+        trades=self.exchange.fetch_my_trades(self.cfg.symbol,limit=200) if hasattr(self.exchange,'fetch_my_trades') else []
+        buy_qty=buy_cost=sell_qty=sell_cost=D('0')
+        for trade in trades:
+            amount=D(str(trade.get('amount') or trade.get('filled') or '0'))
+            cost=D(str(trade.get('cost') or '0'))
+            if str(trade.get('side','')).lower()=='buy': buy_qty+=amount; buy_cost+=cost
+            elif str(trade.get('side','')).lower()=='sell': sell_qty+=amount; sell_cost+=cost
+        net_cost=buy_cost-sell_cost
+        average=(net_cost/quantity) if net_cost>0 and quantity>0 else D(str(self.exchange.ticker(self.cfg.symbol).get('last') or '0'))
+        if average<=0: raise RuntimeError('تعذر تحديد متوسط تكلفة الرصيد الموجود؛ تم إيقاف Grid بأمان')
+        cost=quantity*average
+        self.db.update_position(
+            symbol=self.cfg.symbol, quantity=str(quantity), cost=str(cost), average_entry=str(average),
+            spent=str(cost), remaining_budget=str(max(D('0'),self.cfg.total_budget-cost)),
+            grid_reference=str(average), state='ACTIVE', dca4_complete=1 if cost>=self.cfg.total_budget else 0,
+        )
+        self.db.event('existing_position_adopted', {'symbol':self.cfg.symbol,'quantity':str(quantity),'average_entry':str(average),'cost':str(cost)})
+        return True
     def _new_client_id(self,role,level):
         # A deterministic key for the strategy intent prevents a retry from creating a second order.
         row=self.db.conn.execute('SELECT COALESCE(MAX(id),0)+1 AS n FROM grid_orders').fetchone(); return f'grid-{role[:3]}-{level}-{row["n"]}-{uuid.uuid4().hex[:8]}'
@@ -76,6 +111,8 @@ class TradingService:
                 self.db.update_position(state='FROZEN')
                 self.db.event('recovery_ambiguous_order',{'client_order_id':l['client_order_id'],'role':l['role']})
         if any(o['status']=='unknown' for o in self.db.open_orders()): self.db.update_position(state='FROZEN')
+        if self._position()['state'] != 'FROZEN':
+            self._adopt_existing_position()
         p=self._position()
         if p['state']!='FROZEN' and not p['emergency_stop'] and D(p['quantity'])>0:
             active_tps=[o for o in self.db.open_orders() if o['role']=='tp']
