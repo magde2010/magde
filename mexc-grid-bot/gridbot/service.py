@@ -21,7 +21,7 @@ class TradingService:
         p=self._position(); return Position(p['quantity'],p['cost'],p['spent'])
     def _save_accounting(self,accounting,**extra):
         self.db.update_position(quantity=str(accounting.quantity),cost=str(accounting.cost),average_entry=str(accounting.average_entry),spent=str(accounting.spent),remaining_budget=str(max(D('0'),self.cfg.total_budget-accounting.spent)),**extra)
-    def _adopt_existing_position(self):
+    def _adopt_existing_position(self, balance_only=False):
         """Adopt an existing spot balance instead of buying the initial slice again."""
         if self.cfg.dry_run or not hasattr(self.exchange, 'fetch_balance'):
             return False
@@ -38,7 +38,7 @@ class TradingService:
         quantity=D(str(total or '0'))
         if quantity <= 0:
             return False
-        trades=self.exchange.fetch_my_trades(self.cfg.symbol,limit=200) if hasattr(self.exchange,'fetch_my_trades') else []
+        trades=[] if balance_only else (self.exchange.fetch_my_trades(self.cfg.symbol,limit=200) if hasattr(self.exchange,'fetch_my_trades') else [])
         buy_qty=buy_cost=sell_qty=sell_cost=D('0')
         for trade in trades:
             amount=D(str(trade.get('amount') or trade.get('filled') or '0'))
@@ -46,7 +46,7 @@ class TradingService:
             if str(trade.get('side','')).lower()=='buy': buy_qty+=amount; buy_cost+=cost
             elif str(trade.get('side','')).lower()=='sell': sell_qty+=amount; sell_cost+=cost
         net_cost=buy_cost-sell_cost
-        average=(net_cost/quantity) if net_cost>0 and quantity>0 else D(str(self.exchange.ticker(self.cfg.symbol).get('last') or '0'))
+        average=(net_cost/quantity) if net_cost>0 and quantity>0 and not balance_only else D(str(self.exchange.ticker(self.cfg.symbol).get('last') or '0'))
         if average<=0: raise RuntimeError('تعذر تحديد متوسط تكلفة الرصيد الموجود؛ تم إيقاف Grid بأمان')
         cost=quantity*average
         self.db.update_position(

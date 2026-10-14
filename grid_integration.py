@@ -343,7 +343,9 @@ def restart_grid_strategy():
                 raise RuntimeError(f'لم يتم تأكيد إلغاء الأمر {oid}')
             canceled += 1
         service.db.reset_strategy_orders()
-        adopted = service._adopt_existing_position()
+        # Full restart deliberately forgets historical fills and TP/DCA state;
+        # only the current spot balance is carried into the new strategy.
+        adopted = service._adopt_existing_position(balance_only=True)
         if not adopted:
             service.db.update_position(symbol=service.cfg.symbol, state='PAUSED', running=0)
         if service._position()['quantity'] and service._position()['state'] != 'FROZEN':
