@@ -1337,7 +1337,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
         if not p.is_running:
             await query.edit_message_text(
                 "⚠️ المحفظة متوقفة.\nشغّلها أولاً ثم استخدم *إعادة بناء المراكز*.",
-                parse_mode="Markdown",
+
                 reply_markup=pf_keyboard(pf_id, False),
             )
             return
@@ -1368,7 +1368,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
             f"♻️ *إعادة بناء مراكز محفظة {p.name}*\n"
             + ui.SEP + "\n"
             "① إلغاء الأهداف القديمة من المنصة...",
-            parse_mode="Markdown",
+
         )
 
         client = get_mexc()
@@ -1411,7 +1411,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
             + ui.SEP + "\n"
             f"① أُلغي `{cancelled_count}` أمر قديم\n"
             "② فحص الرصيد الفعلي...",
-            parse_mode="Markdown",
+
         )
 
         # 2) انتظار قصير بعد الإلغاء ثم قراءة الرصيد من جديد
@@ -1461,7 +1461,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
             f"USDT متاح: `{free_usdt:.2f}$`\n"
             f"تحت الهدف: `{len(under)}` | فوق الهدف: `{len(overweight)}` | متوازن: `{len(ok_coins)}`\n"
             "③ بيع الزائد ثم تكميل الناقص...",
-            parse_mode="Markdown",
+
         )
 
         sold_trim = []
@@ -1608,7 +1608,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
             f"② هدف كل عملة: `{target_per_coin:.2f}$`\n"
             f"③ اشتريت: `{len(bought)}` | كمّلت: `{len(topped)}` | صُرف: `{total_spent:.2f}$`\n"
             "④ إعادة وضع الأهداف للباقي...",
-            parse_mode="Markdown",
+
         )
 
         refreshed = list(bought)  # already have TP from reentry_buy
@@ -1720,7 +1720,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
                 lines.append("\n💡 حوّل USDT إضافي للحساب ثم أعد *إعادة بناء المراكز*.")
         await query.edit_message_text(
             "\n".join(lines),
-            parse_mode="Markdown",
+
             reply_markup=pf_keyboard(pf_id, True),
         )
     except Exception as exc:
