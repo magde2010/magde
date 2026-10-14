@@ -247,13 +247,13 @@ class TradingService:
             await asyncio.sleep(self.cfg.poll_seconds)
     def status_text(self):
         p=self._position(); orders=self.db.orders()
-        labels={'open':'مفتوح','partially_filled':'منفذ جزئي','closed':'تم','canceled':'ملغى','pending':'جاري','unknown':'مراجعة','cancel_pending':'إلغاء','rejected':'مرفوض','expired':'منتهي'}
-        def row(role, level):
+        labels={'open':'بانتظار التنفيذ','partially_filled':'منفذ جزئي','closed':'تم التفعيل','canceled':'بانتظار التفعيل','pending':'جاري التجهيز','unknown':'مراجعة','cancel_pending':'جاري الإلغاء','rejected':'بانتظار التفعيل','expired':'بانتظار التفعيل'}
+        def row(role, level, configured, amount=None):
             order=next((o for o in reversed(orders) if o['role']==role and int(o['level'])==level), None)
-            if not order: return 'غير جاهز'
-            status=labels.get(order['status'], order['status'])
-            price=order.get('price') or '-'
-            return f'{status} — {price}$'
+            status=labels.get(order['status'], order['status']) if order else 'بانتظار التفعيل'
+            detail=f'{configured}'
+            if amount is not None: detail += f' — {amount}'
+            return f'{status} — {detail}'
         mode='حقيقي' if not self.cfg.dry_run else 'تجريبي'
         state={'ACTIVE':'يعمل','PAUSED':'متوقف','IDLE':'جاهز','DEFENSIVE':'وضع دفاعي','FROZEN':'متجمد','EMERGENCY_STOP':'طوارئ'}.get(p['state'],p['state'])
         error='\n⚠️ يوجد خطأ — أرسل صورة هذه الشاشة للمراجعة.' if self.last_error else ''
@@ -264,7 +264,13 @@ class TradingService:
                 f"المستخدم: {p['spent']} USDT\n"
                 f"متوسط الشراء: {p['average_entry'] or '-'}\n\n"
                 f"🟦 الشراء عند الهبوط\n"
-                f"1) {row('dca',1)}\n2) {row('dca',2)}\n3) {row('dca',3)}\n4) {row('dca',4)}\n\n"
+                f"1) {row('dca',1, f'هبوط {self.cfg.dca_drops[0]}%', f'توزيع {self.cfg.dca_allocations[0]}%')}\n"
+                f"2) {row('dca',2, f'هبوط {self.cfg.dca_drops[1]}%', f'توزيع {self.cfg.dca_allocations[1]}%')}\n"
+                f"3) {row('dca',3, f'هبوط {self.cfg.dca_drops[2]}%', f'توزيع {self.cfg.dca_allocations[2]}%')}\n"
+                f"4) {row('dca',4, f'هبوط {self.cfg.dca_drops[3]}%', f'توزيع {self.cfg.dca_allocations[3]}%')}\n\n"
                 f"🟩 البيع عند الصعود\n"
-                f"1) {row('tp',1)}\n2) {row('tp',2)}\n3) {row('tp',3)}\n4) {row('tp',4)}\n"
+                f"1) {row('tp',1, f'ربح {self.cfg.tp_gains[0]}%', f'بيع {self.cfg.tp_sell_pcts[0]}%')}\n"
+                f"2) {row('tp',2, f'ربح {self.cfg.tp_gains[1]}%', f'بيع {self.cfg.tp_sell_pcts[1]}%')}\n"
+                f"3) {row('tp',3, f'ربح {self.cfg.tp_gains[2]}%', f'بيع {self.cfg.tp_sell_pcts[2]}%')}\n"
+                f"4) {row('tp',4, f'ربح {self.cfg.tp_gains[3]}%', f'بيع {self.cfg.tp_sell_pcts[3]}%')}\n"
                 f"{error}")
