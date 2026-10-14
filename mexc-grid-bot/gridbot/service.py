@@ -216,6 +216,13 @@ class TradingService:
     def _place_initial_if_needed(self,price):
         p=self._position()
         if D(p['quantity'])>0 or any(o['role']=='initial' and o['status'] in ACTIVE|TERMINAL for o in self.db.orders()): return
+        if not self.cfg.dry_run:
+            remote=list(self.exchange.fetch_open_orders(self.cfg.symbol) or [])
+            foreign_grid=[o for o in remote if str(client_id(o) or '').startswith('grid-')]
+            if foreign_grid:
+                self.db.update_position(state='FROZEN', running=0)
+                self.db.event('remote_grid_order_blocked_duplicate_entry', {'count':len(foreign_grid),'symbol':self.cfg.symbol})
+                raise RuntimeError('يوجد أمر Grid قديم مفتوح؛ تم منع شراء جديد حتى مراجعته أو إلغائه')
         amount=self.cfg.initial_budget/price
         # The first LIVE entry must not wait for a limit-price touch. DCA and
         # TP remain limit orders; only the initial allocation uses market.

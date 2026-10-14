@@ -275,7 +275,31 @@ def replace_grid_orders():
     if service.cfg.dry_run:
         return False, "Grid ليس في وضع LIVE."
     try:
-        before = len(service.db.open_orders())
+        from gridbot.recovery import client_id
+        remote_cancelled = 0
+        remote = list(service.exchange.fetch_open_orders(service.cfg.symbol) or [])
+        # Local SQLite may have been lost after a deploy. Match only our
+        # deterministic grid-* client IDs; never cancel unrelated user orders.
+        for order in remote:
+            cid = str(client_id(order) or '')
+            if not cid.startswith('grid-'):
+                continue
+            oid = order.get('id')
+            if not oid:
+                raise RuntimeError('وجد أمر Grid قديم بلا رقم يمكن إلغاؤه؛ تم الإيقاف بأمان')
+            service.exchange.cancel_order(oid, service.cfg.symbol)
+            checked = service.exchange.fetch_order(oid, service.cfg.symbol)
+            if not checked or str(checked.get('status','')).lower() not in ('canceled','cancelled','closed','rejected','expired'):
+                raise RuntimeError(f'لم يتم تأكيد إلغاء الأمر {oid}')
+            local = service.db.order_by_client_id(cid)
+            if local:
+                checked_status = str(checked.get('status','')).lower()
+                if checked_status == 'closed':
+                    service._sync_order(local, checked, rebuild_tps=False)
+                else:
+                    service.db.update_order(cid, exchange_order_id=str(oid), status='canceled', raw_status='canceled', last_error=None)
+            remote_cancelled += 1
+        before = len(service.db.open_orders()) + remote_cancelled
         service._cancel_owned({'initial', 'dca', 'tp'})
         service.db.update_position(running=0, state='PAUSED', emergency_stop=0)
         service._adopt_existing_position()
@@ -284,7 +308,7 @@ def replace_grid_orders():
             service._ensure_dca()
             service.db.update_position(state='PAUSED', running=0)
         after = len(service.db.open_orders())
-        return True, f"تم إلغاء {before} أمر Grid وإعادة بناء {after} أمرًا للعملة {service.cfg.symbol}. المركز والرصيد لم يُباعا."
+        return True, f"تم إلغاء {before} أمر Grid قديم وإعادة بناء {after} أمرًا للعملة {service.cfg.symbol}. المركز والرصيد لم يُباعا."
     except Exception as exc:
         service.last_error = f"{type(exc).__name__}: {exc}"
         service.db.update_position(state='FROZEN', running=0)
