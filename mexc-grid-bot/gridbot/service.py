@@ -245,6 +245,21 @@ class TradingService:
         # TP remain limit orders; only the initial allocation uses market.
         initial_type = 'market' if not self.cfg.dry_run else 'limit'
         self._persist_order('initial',0,'buy',price,amount,order_type=initial_type)
+    def _top_up_initial_allocation(self):
+        """On a full restart, top up an existing balance to the initial allocation."""
+        if self.cfg.dry_run:
+            return False
+        p=self._position()
+        if D(p['quantity'])<=0 or any(o['role']=='initial' for o in self.db.orders()):
+            return False
+        need=max(D('0'), self.cfg.initial_budget-D(p['spent']))
+        if need<=0:
+            return False
+        price=D(str(self.exchange.ticker(self.cfg.symbol).get('last') or '0'))
+        if price<=0:
+            raise RuntimeError('تعذر قراءة السعر لإكمال نسبة الدخول الأولي')
+        self._persist_order('initial',0,'buy',price,need/price,order_type='market')
+        return True
     def _ensure_dca(self):
         p=self._position()
         if p['dca4_complete'] or p['emergency_stop'] or p['state']=='FROZEN': return

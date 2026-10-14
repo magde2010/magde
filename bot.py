@@ -954,7 +954,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "⚠️ *إعادة تشغيل عامة لـ Grid*\n\n"
             f"العملة: `{service.cfg.symbol}` — الميزانية: `{service.cfg.total_budget}` USDT\n"
-            "سيتم إلغاء أوامر Grid القديمة فقط، نسيان سجل Grid والصفقات القديمة، ومزامنة كمية العملة الموجودة حاليًا فقط، ثم إعادة توزيع DCA وTP بنفس الإعدادات.\n"
+            "سيتم نسيان سجل Grid القديم، مزامنة كمية العملة الموجودة، ثم إكمال الدخول الأولي إلى النسبة المحددة (50% مثلًا) وترك الباقي لـ DCA وTP بنفس الإعدادات.\n"
             "لن يتم بيع المركز ولن يتم لمس نظام المحافظ.\n\nهل تريد التنفيذ؟",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
