@@ -144,6 +144,7 @@ def get_grid_service():
     package_root = Path(__file__).resolve().parent / "mexc-grid-bot"
     if str(package_root) not in sys.path:
         sys.path.insert(0, str(package_root))
+    service = None
     try:
         from gridbot.config import config_from_env
         from gridbot.db import GridDB
@@ -179,6 +180,12 @@ def get_grid_service():
     except Exception as exc:
         _error = f"تعذر تهيئة Grid: {type(exc).__name__}: {exc}"
         log.exception("Grid initialization failed")
+        if service is not None and _db is not None and "Order creation uncertain" in str(exc):
+            service.recovered = True
+            service.last_error = str(exc)
+            _db.update_position(state="FROZEN", running=0)
+            _service = service
+            return _service, None
         if _db is not None:
             try: _db.close()
             except Exception: pass

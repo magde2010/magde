@@ -80,6 +80,11 @@ class TradingService:
             if D(str(remote.get('filled') or '0'))>0: self._sync_order(saved,remote)
             return self.db.order_by_client_id(cid)
         except Exception as exc:
+            rejected_names={'InvalidOrder','BadRequest','InsufficientFunds','AuthenticationError','PermissionDenied','NotSupported','ExchangeError'}
+            if type(exc).__name__ in rejected_names:
+                self.db.update_order(cid,status='rejected',raw_status='rejected',last_error=type(exc).__name__)
+                self.db.event('order_rejected',{'client_order_id':cid,'role':role,'level':level,'error_type':type(exc).__name__})
+                return self.db.order_by_client_id(cid)
             self.db.update_order(cid,status='unknown',last_error=type(exc).__name__)
             self.db.event('order_create_uncertain',{'client_order_id':cid,'error_type':type(exc).__name__})
             self.db.update_position(state='FROZEN')
