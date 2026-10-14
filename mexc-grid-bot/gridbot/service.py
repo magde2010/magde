@@ -309,13 +309,20 @@ class TradingService:
         labels={'open':'بانتظار التنفيذ','partially_filled':'منفذ جزئي','closed':'تم التفعيل','canceled':'بانتظار التفعيل','pending':'جاري التجهيز','unknown':'مراجعة','cancel_pending':'جاري الإلغاء','rejected':'بانتظار التفعيل','expired':'بانتظار التفعيل'}
         def row(role, level, configured, amount=None):
             order=next((o for o in reversed(orders) if o['role']==role and int(o['level'])==level), None)
-            status=labels.get(order['status'], order['status']) if order else 'بانتظار التفعيل'
+            if not order and role == 'dca' and D(p['spent']) >= self.cfg.total_budget:
+                status='الميزانية مكتملة — لن يشتري'
+            elif not order and role == 'tp' and D(p['quantity']) > 0:
+                status='بانتظار بناء أمر البيع'
+            else:
+                status=labels.get(order['status'], order['status']) if order else 'بانتظار التفعيل'
             detail=f'{configured}'
             if amount is not None: detail += f' — {amount}'
             return f'{status} — {detail}'
         mode='حقيقي' if not self.cfg.dry_run else 'تجريبي'
         state={'ACTIVE':'يعمل','PAUSED':'متوقف','IDLE':'جاهز','DEFENSIVE':'وضع دفاعي','FROZEN':'متجمد','EMERGENCY_STOP':'طوارئ'}.get(p['state'],p['state'])
-        error='\n⚠️ يوجد خطأ — أرسل صورة هذه الشاشة للمراجعة.' if self.last_error else ''
+        error='\n⚠️ الميزانية المستخدمة أعلى قليلًا من المحددة بسبب المركز السابق/الرسوم؛ لن يتم شراء DCA إضافي.' if D(p['spent']) > self.cfg.total_budget else ''
+        if self.last_error:
+            error += '\n⚠️ توجد مراجعة مطلوبة لأمر سابق.'
         return (f"الحالة: {state} ({mode})\n"
                 f"العملة: {self.cfg.symbol}\n"
                 f"السعر الآن: {self.last_price or '-'}$\n"
