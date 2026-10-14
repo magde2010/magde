@@ -56,6 +56,10 @@ def _apply_saved(cfg, saved):
         elif key != "symbol":
             value = Decimal(str(value))
         setattr(cfg, attr, value)
+    if "dry_run" in saved:
+        cfg.dry_run = bool(saved["dry_run"])
+    if "live_enabled" in saved:
+        cfg.live_enabled = bool(saved["live_enabled"])
     return cfg.validate()
 
 
@@ -131,6 +135,27 @@ def update_grid_setting(field, raw_value):
         return True, "تم حفظ الإعداد بنجاح."
     except Exception as exc:
         return False, f"إعداد غير صالح: {exc}"
+
+
+def switch_grid_mode(live):
+    """Persist and reload the exchange adapter; strategy remains paused."""
+    service, error = get_grid_service()
+    if error:
+        return False, error
+    if service.db.position().get("running") or service.db.open_orders():
+        return False, "أوقف Grid أولًا وتأكد من عدم وجود أوامر مفتوحة."
+    if live and not (os.getenv("MEXC_API_KEY") and os.getenv("MEXC_API_SECRET")):
+        return False, "مفاتيح MEXC غير موجودة في بيئة التشغيل. لا ترسلها عبر Telegram."
+    payload = _payload(service.cfg)
+    payload["dry_run"] = not live
+    payload["live_enabled"] = bool(live)
+    service.db.save_config(payload)
+    grid_shutdown()
+    fresh, fresh_error = get_grid_service()
+    if fresh_error:
+        return False, fresh_error
+    fresh.db.update_position(running=0, state="PAUSED", emergency_stop=0)
+    return True, "تم التحويل إلى LIVE وإعادة تحميل الاتصال. Grid ما زال متوقفًا؛ اضغط تشغيل Grid عند استعدادك." if live else "تم الرجوع إلى DRY RUN."
 
 
 async def grid_monitor_job(context):

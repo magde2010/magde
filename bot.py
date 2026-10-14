@@ -801,6 +801,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "⚙️ *إعدادات Grid*\n\n"
             f"العملة: `{c.symbol}`\nالميزانية: `{c.total_budget}` USDT\nالدخول الأولي: `{c.initial_pct}%`\n"
+            f"الوضع: `{'DRY RUN' if c.dry_run else 'LIVE'}`\n"
             f"DCA هبوط: `{','.join(map(str, c.dca_drops))}%`\n"
             f"DCA توزيع: `{','.join(map(str, c.dca_allocations))}%`\n"
             f"TP أهداف: `{','.join(map(str, c.tp_gains))}%`\n"
@@ -815,8 +816,38 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("توزيع DCA الأربعة", callback_data="grid_set_dca_allocations")],
                 [InlineKeyboardButton("أهداف TP الأربعة", callback_data="grid_set_tp_gains")],
                 [InlineKeyboardButton("نسب بيع TP الأربعة", callback_data="grid_set_tp_sell_pcts")],
+                [InlineKeyboardButton("🔴 طلب التحويل إلى LIVE", callback_data="grid_live_request"), InlineKeyboardButton("🟡 العودة إلى Dry Run", callback_data="grid_dry_run")],
                 [InlineKeyboardButton("↩ رجوع إلى Grid", callback_data="grid_menu")],
             ]),
+        )
+        return
+    if data == "grid_live_request":
+        from grid_integration import get_grid_service
+        service, error = get_grid_service()
+        if error:
+            await query.edit_message_text(f"⚠️ {error}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ رجوع", callback_data="grid_settings")]]))
+            return
+        await query.edit_message_text(
+            "⚠️ *تأكيد التداول الحقيقي*\n\n"
+            f"العملة: `{service.cfg.symbol}`\n"
+            f"إجمالي الميزانية: `{service.cfg.total_budget}` USDT\n"
+            f"الدخول الأولي: `{service.cfg.initial_pct}%`\n"
+            "بعد التأكيد سيتصل النظام بحساب MEXC ويرسل أوامر فعلية عند تشغيل Grid.\n"
+            "تأكد أن مفتاح MEXC للسوق الفوري فقط وبدون صلاحية سحب.\n\n"
+            "التأكيد لا يبدأ التداول تلقائيًا؛ سيبقى Grid متوقفًا.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ أؤكد التحويل إلى LIVE", callback_data="grid_live_confirm")],
+                [InlineKeyboardButton("إلغاء", callback_data="grid_settings")],
+            ]),
+        )
+        return
+    if data in {"grid_live_confirm", "grid_dry_run"}:
+        from grid_integration import switch_grid_mode
+        ok, message = switch_grid_mode(data == "grid_live_confirm")
+        await query.edit_message_text(
+            ("✅ " if ok else "⚠️ ") + message,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ إعدادات Grid", callback_data="grid_settings"), InlineKeyboardButton("↩ Grid", callback_data="grid_menu")]]),
         )
         return
     if data.startswith("grid_set_"):
@@ -865,8 +896,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("▶️ تشغيل Grid", callback_data="grid_run"), InlineKeyboardButton("⏸ إيقاف", callback_data="grid_stop")],
                 [InlineKeyboardButton("🛑 إيقاف طوارئ", callback_data="grid_emergency")],
+                [InlineKeyboardButton("📊 متابعة المستويات", callback_data="grid_levels")],
                 [InlineKeyboardButton("⚙️ إعدادات Grid", callback_data="grid_settings")],
                 [InlineKeyboardButton("🔄 تحديث", callback_data="grid_menu"), InlineKeyboardButton("↩ القائمة", callback_data="menu")],
+            ]),
+        )
+        return
+    if data == "grid_levels":
+        from grid_integration import get_grid_service
+        service, error = get_grid_service()
+        if error:
+            await query.edit_message_text(f"⚠️ {error}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Grid", callback_data="grid_menu")]]))
+            return
+        await query.edit_message_text(
+            "📊 *متابعة Grid التفصيلية*\n\n" + service.status_text(),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 تحديث", callback_data="grid_levels")],
+                [InlineKeyboardButton("⚙️ الإعدادات", callback_data="grid_settings"), InlineKeyboardButton("↩ Grid", callback_data="grid_menu")],
             ]),
         )
         return
@@ -899,6 +945,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("▶️ تشغيل", callback_data="grid_run"), InlineKeyboardButton("⏸ إيقاف", callback_data="grid_stop")],
                 [InlineKeyboardButton("🛑 طوارئ", callback_data="grid_emergency")],
+                [InlineKeyboardButton("📊 متابعة المستويات", callback_data="grid_levels")],
                 [InlineKeyboardButton("⚙️ إعدادات Grid", callback_data="grid_settings")],
                 [InlineKeyboardButton("🔄 تحديث", callback_data="grid_menu"), InlineKeyboardButton("↩ القائمة", callback_data="menu")],
             ]),
