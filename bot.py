@@ -1726,8 +1726,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
     except Exception as exc:
         logger.exception("rebuild_positions failed")
         await query.edit_message_text(
-            f"❌ فشل إعادة البناء:\n`{exc}`",
-            parse_mode="Markdown",
+            f"❌ فشل إعادة البناء:\n{str(exc)[:900]}",
             reply_markup=pf_keyboard(pf_id, True),
         )
     finally:
