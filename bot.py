@@ -210,6 +210,7 @@ def main_menu_keyboard():
     return ui.markup([
         ui.row((f"{ui.I['portfolio']}  المحافظ", "list_pf"), (f"{ui.I['new']}  محفظة جديدة", "create_pf")),
         ui.row((f"{ui.I['balance']}  الرصيد", "balance"), (f"{ui.I['settings']}  الإعدادات", "settings")),
+        [ui.button("▦  نظام Grid", "grid_menu")],
         [ui.button(f"{ui.I['cleanup']}  تنظيف البيانات", "cleanup_db")],
     ])
 
@@ -780,6 +781,72 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     data = query.data or ""
     tid = update.effective_user.id
+    if data == "grid_menu":
+        from grid_integration import get_grid_service
+        service, error = get_grid_service()
+        if error:
+            await query.edit_message_text(
+                f"⚠️ {error}\n\nتأكد من إعدادات GRID_* ثم أعد تشغيل البوت.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ القائمة", callback_data="menu")]]),
+            )
+            return
+        p = service.db.position()
+        state = p.get("state") or "IDLE"
+        mode = "DRY RUN" if service.cfg.dry_run else "LIVE"
+        text = (
+            "▦ *نظام Grid المستقل*\n\n"
+            f"العملة: `{service.cfg.symbol}`\n"
+            f"الوضع: `{mode}`\n"
+            f"الحالة: `{state}`\n"
+            f"الميزانية: `{service.cfg.total_budget}` USDT\n"
+            f"المنصرف: `{p.get('spent', '0')}` USDT\n"
+            f"المتبقي: `{p.get('remaining_budget', '0')}` USDT\n"
+            f"المتوسط: `{p.get('average_entry', '0')}`\n\n"
+            "النظام يبدأ متوقفًا. شغّله بعد مراجعة الإعدادات."
+        )
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("▶️ تشغيل Grid", callback_data="grid_run"), InlineKeyboardButton("⏸ إيقاف", callback_data="grid_stop")],
+                [InlineKeyboardButton("🛑 إيقاف طوارئ", callback_data="grid_emergency")],
+                [InlineKeyboardButton("🔄 تحديث", callback_data="grid_menu"), InlineKeyboardButton("↩ القائمة", callback_data="menu")],
+            ]),
+        )
+        return
+    if data in {"grid_run", "grid_stop", "grid_emergency"}:
+        from grid_integration import get_grid_service
+        service, error = get_grid_service()
+        if error:
+            await query.edit_message_text(f"⚠️ {error}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ القائمة", callback_data="menu")]]))
+            return
+        if data == "grid_run":
+            p = service.db.position()
+            if p.get("emergency_stop") or p.get("state") == "FROZEN":
+                await query.answer("لا يمكن التشغيل: Emergency Stop أو FROZEN", show_alert=True)
+                return
+            service.db.update_position(running=1, state="ACTIVE")
+            service.db.event("strategy_started", {"by": tid, "source": "portfolio_bot"})
+        elif data == "grid_stop":
+            service.db.update_position(running=0, state="PAUSED")
+            service.db.event("strategy_paused", {"by": tid, "source": "portfolio_bot"})
+        else:
+            service.db.update_position(emergency_stop=1, running=0, state="EMERGENCY_STOP")
+            service.db.event("emergency_stop", {"by": tid, "source": "portfolio_bot"})
+        await query.answer("تم تحديث حالة Grid")
+        # Re-render the same screen after the state change.
+        service, _ = get_grid_service()
+        p = service.db.position()
+        await query.edit_message_text(
+            f"▦ *Grid* — `{p.get('state')}`\nالعملة: `{service.cfg.symbol}`\nالمنصرف: `{p.get('spent', '0')}` USDT\nالمتبقي: `{p.get('remaining_budget', '0')}` USDT",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("▶️ تشغيل", callback_data="grid_run"), InlineKeyboardButton("⏸ إيقاف", callback_data="grid_stop")],
+                [InlineKeyboardButton("🛑 طوارئ", callback_data="grid_emergency")],
+                [InlineKeyboardButton("🔄 تحديث", callback_data="grid_menu"), InlineKeyboardButton("↩ القائمة", callback_data="menu")],
+            ]),
+        )
+        return
     if data == "menu":
         await query.edit_message_text(
             ui.page_title(ui.I["home"], "لوحة التحكم", "اختار القسم المطلوب من القائمة:") + ui.footer(),
@@ -3886,6 +3953,21 @@ def main():
             "Position monitor job scheduled (every %.1fs)",
             config.STOP_MONITOR_INTERVAL_SECONDS,
         )
+        try:
+            from grid_integration import get_grid_service, grid_monitor_job
+            grid_service, grid_error = get_grid_service()
+            if grid_service is not None:
+                app.job_queue.run_repeating(
+                    grid_monitor_job,
+                    interval=max(5, grid_service.cfg.poll_seconds),
+                    first=10,
+                    job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 30},
+                )
+                logger.info("Grid monitor scheduled (every %ss)", max(5, grid_service.cfg.poll_seconds))
+            elif grid_error:
+                logger.warning("Grid is unavailable; portfolio bot will continue: %s", grid_error)
+        except Exception:
+            logger.exception("Grid integration failed; portfolio bot will continue")
     else:
         logger.warning("JobQueue not available — install python-telegram-bot[job-queue]")
 
