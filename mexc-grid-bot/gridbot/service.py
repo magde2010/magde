@@ -212,6 +212,14 @@ class TradingService:
             base=p.quantity
             self.db.update_position(tp_base_quantity=str(base))
         sold_by_level={i:sum((D(o.get('filled') or '0') for o in self.db.orders() if o['role']=='tp' and int(o['level'])==i),D('0')) for i in range(1,5)}
+        planned_remaining=sum((max(D('0'), (base*pct/D('100') if i<4 else max(D('0'),base-sum((base*x/D('100') for x in self.cfg.tp_sell_pcts[:3]),D('0'))))-sold_by_level[i]) for i,(pct,_) in enumerate(zip(self.cfg.tp_sell_pcts,self.cfg.tp_gains),1)),D('0'))
+        if planned_remaining <= 0 and p.quantity > 0:
+            # Legacy TP rebuilds may have recorded repeated sales against old
+            # targets. Start a clean TP cycle for only the quantity still held.
+            base=p.quantity
+            sold_by_level={i:D('0') for i in range(1,5)}
+            self.db.update_position(tp_base_quantity=str(base))
+            self.db.event('tp_cycle_reset_for_remaining_position', {'quantity':str(base)})
         remaining=p.quantity
         for i,(gain,pct) in enumerate(zip(self.cfg.tp_gains,self.cfg.tp_sell_pcts),1):
             if pct<=0: continue
