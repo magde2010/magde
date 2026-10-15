@@ -1962,19 +1962,26 @@ async def _do_rebuild_positions(query, tid, pf_id):
             action_summary = "لم يتم شراء أو بيع؛ تم تحديث خطة الحماية فقط"
         value_delta = total_value - target_per_coin * n_coins
         delta_text = f"أعلى من الهدف بـ `{value_delta:.2f}$`" if value_delta >= 0 else f"أقل من الهدف بـ `{abs(value_delta):.2f}$`"
-        lines = [
+        def _with_dividers(items):
+            result = []
+            for index, item in enumerate(items):
+                result.append(item)
+                if index < len(items) - 1:
+                    result.append("────────────")
+            return result
+
+        lines = _with_dividers([
             f"✅ *تم تحديث محفظة* `{p.name}`",
-            "━━━━━━━━━━━━━━━━━━━━",
             "🟢 الحالة: المراكز جاهزة للمراقبة",
             f"💰 الميزانية المستهدفة: *`{allocated:.2f}$`*",
             f"📊 القيمة الحالية: *`{total_value:.2f}$`* — {delta_text}",
             f"💵 رصيد USDT المتاح: *`{free_after:.2f}$`*",
             f"🔧 النتيجة: {action_summary}",
             f"🎯 تم تحديث الأهداف والاستوب لـ `{len(refreshed)}` عملة",
-        ]
+        ])
         if rebuilt_coins:
-            lines.extend(["", "📋 *خطة التداول الحالية*"])
-            for coin in rebuilt_coins:
+            lines.extend(["", "━━━━━━━━━━━━━━━━━━━━", "📋 *خطة التداول الحالية*", ""])
+            for coin_index, coin in enumerate(rebuilt_coins):
                 entry = float(coin.entry_price or 0)
                 tp1_price = float(coin.tp1_price or 0)
                 tp2_price = float(coin.tp2_price or 0)
@@ -1993,7 +2000,9 @@ async def _do_rebuild_positions(query, tid, pf_id):
                 if abs(current_sl - sl_price) > max(abs(sl_price) * 1e-9, 1e-12):
                     coin_lines.append(f"🛡 الوقف الحالي: `{current_sl:.8g}`")
                 coin_lines.append("🔄 بعد الهدف 2: المتبقي يحميه وقف متحرك")
-                lines.extend(coin_lines)
+                lines.extend(_with_dividers(coin_lines))
+                if coin_index < len(rebuilt_coins) - 1:
+                    lines.extend(["", "────────────", ""])
         all_errs = cancel_errors[:3] + sell_errors + buy_errors + refresh_errors
         if all_errs:
             lines.append("\n⚠️ ملاحظات:")
