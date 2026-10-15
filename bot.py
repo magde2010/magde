@@ -1618,8 +1618,15 @@ async def _do_rebuild_positions(query, tid, pf_id):
         cancelled_count = 0
         cancel_errors = []
 
-        # 1) Cancel DB-known TP orders + any open sells on exchange
+        # 1) Cancel DB-known TP orders and legacy untracked portfolio sells.
+        # Portfolio TP is code-monitored now; the portfolio owns sell orders for
+        # its symbols during this operation, so stale exchange orders are removed.
         for coin in p.coins:
+            known_ids = {
+                str(getattr(coin, key))
+                for key in ("tp_order_id", "tp1_order_id", "tp2_order_id", "tp3_order_id")
+                if getattr(coin, key, None)
+            }
             try:
                 res = reb.cancel_tp_orders([{
                     "symbol": coin.symbol,
@@ -1633,6 +1640,15 @@ async def _do_rebuild_positions(query, tid, pf_id):
                     cancel_errors.append(f"{coin.symbol}: {e.get('error', e)}")
             except Exception as exc:
                 cancel_errors.append(f"{coin.symbol}: {exc}")
+            try:
+                for order in client.fetch_open_sell_orders(coin.symbol) or []:
+                    order_id = str(order.get("id") or "")
+                    if not order_id or order_id in known_ids:
+                        continue
+                    client.cancel_order(order_id, f"{coin.symbol}/{client.quote}", strict=False)
+                    cancelled_count += 1
+            except Exception as exc:
+                cancel_errors.append(f"{coin.symbol}: تعذر تنظيف أمر بيع قديم غير مسجل: {exc}")
             # Clear order IDs from DB immediately
             update_coin_position(
                 db, coin.id,
