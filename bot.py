@@ -1965,10 +1965,23 @@ async def _do_rebuild_positions(query, tid, pf_id):
         refresh_errors = []
         already_done = set(bought) | {t.split("(")[0] for t in topped}
 
+        refresh_total = len(coin_status)
+        refresh_done = 0
         for coin, amt, price, val, need, excess in coin_status:
+            refresh_done += 1
             if coin.symbol in already_done:
                 if coin.symbol not in refreshed:
                     refreshed.append(coin.symbol)
+                if refresh_done % 5 == 0 or refresh_done == refresh_total:
+                    await query.edit_message_text(
+                        f"♻️ *إعادة بناء مراكز محفظة {p.name}*\n"
+                        + ui.SEP + "\n"
+                        f"① أُلغي `{cancelled_count}` أمر\n"
+                        f"② تم شراء/تكميل `{len(bought) + len(topped)}` عملة\n"
+                        f"③ جاري تجهيز الحماية: `{refresh_done}/{refresh_total}` عملة\n"
+                        "④ حساب TP وSL داخل المراقب السحابي...",
+                        parse_mode="Markdown",
+                    )
                 continue
             try:
                 free_amt = client.get_free_amount(coin.symbol)
@@ -2016,6 +2029,16 @@ async def _do_rebuild_positions(query, tid, pf_id):
                 refreshed.append(coin.symbol)
             except Exception as exc:
                 refresh_errors.append(f"{coin.symbol}: {exc}")
+            if refresh_done % 5 == 0 or refresh_done == refresh_total:
+                await query.edit_message_text(
+                    f"♻️ *إعادة بناء مراكز محفظة {p.name}*\n"
+                    + ui.SEP + "\n"
+                    f"① أُلغي `{cancelled_count}` أمر\n"
+                    f"② تم شراء/تكميل `{len(bought) + len(topped)}` عملة\n"
+                    f"③ جاري تجهيز الحماية: `{refresh_done}/{refresh_total}` عملة\n"
+                    "④ حساب TP وSL داخل المراقب السحابي...",
+                    parse_mode="Markdown",
+                )
 
         # أساس حقيقي للحساب من الآن = قيمة المراكز بعد إعادة البناء
         try:
