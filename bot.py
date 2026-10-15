@@ -1911,6 +1911,8 @@ async def _do_rebuild_positions(query, tid, pf_id):
         # may be below the normal trim threshold. If that leaves the missing
         # coin unfunded, release the gap from the largest existing positions.
         required_gap = max(0.0, sum(item[4] for item in under) - free_usdt)
+        funding_sold_usdt = 0.0
+        funding_free_before = free_usdt
         if required_gap >= 1.0:
             under_symbols = {item[0].symbol for item in under}
             candidates = []
@@ -1949,14 +1951,22 @@ async def _do_rebuild_positions(query, tid, pf_id):
                         sell_errors.append(f"{coin.symbol}: لم يتأكد تنفيذ البيع التمويلي")
                         continue
                     total_sold_usdt += filled_value
+                    funding_sold_usdt += filled_value
                     sold_trim.append(f"{coin.symbol}(-{filled_value:.1f}$)")
                     required_gap -= filled_value
                 except Exception as exc:
                     sell_errors.append(f"{coin.symbol}: {exc}")
             if total_sold_usdt > 0:
-                await asyncio.sleep(0.8)
+                # MEXC may report the filled market order before the quote
+                # balance is refreshed. Poll until the funding proceeds are
+                # visible, rather than attempting the buy with stale USDT.
+                expected_free = funding_free_before + funding_sold_usdt * 0.90
+                for _ in range(10):
+                    await asyncio.sleep(0.6)
+                    free_usdt = client.get_free_usdt()
+                    if funding_sold_usdt <= 0 or free_usdt >= expected_free:
+                        break
                 presence = client.get_portfolio_presence(symbols)
-                free_usdt = client.get_free_usdt()
                 under = []
                 for coin in p.coins:
                     info = presence.get(coin.symbol) or presence.get(coin.symbol.upper()) or {}
