@@ -2648,16 +2648,12 @@ async def _do_start(query, tid, pf_id, entry_pct=100):
                 )
                 return
             if free_usdt + 0.01 < purchase_total:
-                await query.edit_message_text(
-                    "⛔ *لا يمكن التشغيل بسبب الرصيد الحر*\n"
-                    f"نسبة الدخول: `{entry_pct}%`\n"
-                    f"ميزانية الشراء المقدرة للعملات الناقصة: `{purchase_total:.2f}` USDT\n"
-                    f"المتاح: `{free_usdt:.2f}` USDT\n"
-                    f"الناقص: `{purchase_total - free_usdt:.2f}` USDT",
-                    parse_mode="Markdown",
-                    reply_markup=pf_keyboard(pf_id, False),
-                )
-                log_action(db, tid, "start_blocked_usdt", f"pct={entry_pct} need={purchase_total:.2f} free={free_usdt:.2f}", False, pf_id)
+                # Existing positions can fund the missing coin. Switch to the
+                # full rebalance path instead of asking the user for fresh USDT;
+                # it sells only per-coin excess above the new equal allocation.
+                set_portfolio_running(db, pf_id, True)
+                db.commit()
+                await _do_rebuild_positions(query, tid, pf_id)
                 return
         balance_lines = []
         for coin in present_coins:
@@ -3821,7 +3817,20 @@ async def add_coin_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = get_or_create_user(db, update.effective_user.id)
         ok, msg = add_coin_to_portfolio(db, pf_id, symbol, max_coins=user.max_coins_per_portfolio or 30)
         context.user_data.clear()
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        p = get_portfolio(db, pf_id, update.effective_user.id)
+        if ok and p:
+            msg += (
+                "\n\n📊 تم إضافة العملة إلى الخطة فقط. "
+                "لإعادة تقسيم المبلغ بالتساوي، اضغط *إعادة توزيع الآن*؛ "
+                "سيبيع البوت الزيادة من المراكز الحالية ثم يشتري الناقص."
+            )
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⚖️ إعادة توزيع الآن", callback_data=f"rebuild_{pf_id}")],
+                [InlineKeyboardButton("↩ المحفظة", callback_data=f"view_{pf_id}")],
+            ])
+        else:
+            markup = main_menu_keyboard()
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=markup)
     finally:
         db.close()
     return ConversationHandler.END
