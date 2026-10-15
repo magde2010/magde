@@ -2674,8 +2674,8 @@ async def _do_trim_holdings(query, tid, pf_id, pct):
         tp1 = _resolved(getattr(p, "tp1_pct", None), getattr(user, "tp1_pct", None), 3.0)
         tp2 = _resolved(getattr(p, "tp2_pct", None), getattr(user, "tp2_pct", None), 5.0)
         tp3 = _resolved(getattr(p, "tp3_pct", None), getattr(user, "tp3_pct", None), 8.0)
-        sell1 = _resolved(getattr(p, "tp1_sell_pct", None), getattr(user, "tp1_sell_pct", None), 40.0)
-        sell2 = _resolved(getattr(p, "tp2_sell_pct", None), getattr(user, "tp2_sell_pct", None), 40.0)
+        s1 = _resolved(getattr(p, "tp1_sell_pct", None), getattr(user, "tp1_sell_pct", None), 40.0)
+        s2 = _resolved(getattr(p, "tp2_sell_pct", None), getattr(user, "tp2_sell_pct", None), 40.0)
         sl_pct = _resolved(getattr(p, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
 
         async def _restore_tp_orders(coin_obj, amount, reference_price):
@@ -2687,7 +2687,7 @@ async def _do_trim_holdings(query, tid, pf_id, pct):
                     None,
                     lambda s=coin_obj.symbol, a=amount, e=reference_price: get_reb().place_tp_orders(
                         [{"symbol": s, "amount": a, "entry_price": e, "place_exchange_orders": False}],
-                        tp1, tp2, tp3, sl_pct, sell1, sell2, control_mode="manual",
+                        tp1, tp2, tp3, sl_pct, s1, s2, control_mode="manual",
                     ),
                 )
                 tr = next((x for x in (tp_res or []) if x.get("symbol") == coin_obj.symbol), None)
@@ -2973,8 +2973,8 @@ async def _do_restore_trimmed(query, tid, pf_id, pct):
         tp1 = _resolved(getattr(pf, "tp1_pct", None), getattr(user, "tp1_pct", None), 3.0)
         tp2 = _resolved(getattr(pf, "tp2_pct", None), getattr(user, "tp2_pct", None), 5.0)
         tp3 = _resolved(getattr(pf, "tp3_pct", None), getattr(user, "tp3_pct", None), 8.0)
-        sell1 = _resolved(getattr(pf, "tp1_sell_pct", None), getattr(user, "tp1_sell_pct", None), 40.0)
-        sell2 = _resolved(getattr(pf, "tp2_sell_pct", None), getattr(user, "tp2_sell_pct", None), 40.0)
+        s1 = _resolved(getattr(pf, "tp1_sell_pct", None), getattr(user, "tp1_sell_pct", None), 40.0)
+        s2 = _resolved(getattr(pf, "tp2_sell_pct", None), getattr(user, "tp2_sell_pct", None), 40.0)
         sl_pct = _resolved(getattr(pf, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
 
         async def _rearm_tp(coin_obj, amount, reference_price):
@@ -2985,7 +2985,7 @@ async def _do_restore_trimmed(query, tid, pf_id, pct):
                     None,
                     lambda s=coin_obj.symbol, a=amount, e=reference_price: get_reb().place_tp_orders(
                         [{"symbol": s, "amount": a, "entry_price": e, "place_exchange_orders": False}],
-                        tp1, tp2, tp3, sl_pct, sell1, sell2, control_mode="manual",
+                        tp1, tp2, tp3, sl_pct, s1, s2, control_mode="manual",
                     ),
                 )
                 trade = next((x for x in (tp_res or []) if x.get("symbol") == coin_obj.symbol), None)
