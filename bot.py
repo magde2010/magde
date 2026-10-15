@@ -1782,10 +1782,25 @@ async def _do_rebuild_positions(query, tid, pf_id):
         min_usdt = float(getattr(config, "BALANCE_PRESENCE_MIN_USDT", 1.0))
         allocated = float(p.investment_usdt or 0)
         n_coins = len(p.coins)
-        target_per_coin = allocated / n_coins if n_coins > 0 else 0.0
+        configured_target_per_coin = allocated / n_coins if n_coins > 0 else 0.0
         free_usdt = client.get_free_usdt()
 
-        # هدف كل عملة = التخصيص ÷ العدد — توازن حقيقي: بيع الزائد + تكميل الناقص
+        # First measure the real wallet value. If the configured budget is no
+        # longer fully present, use the actual available pool instead of asking
+        # for outside USDT. This lets adding a coin sell small portions of the
+        # existing positions and redistribute the current value equally.
+        current_pool_value = sum(
+            float((presence.get(c.symbol) or presence.get(c.symbol.upper()) or {}).get("market_value") or 0)
+            for c in p.coins
+        )
+        effective_pool = max(0.0, current_pool_value) + max(0.0, free_usdt)
+        target_per_coin = (
+            min(configured_target_per_coin, effective_pool / n_coins)
+            if n_coins > 0 else 0.0
+        )
+
+        # Equalize against the real current pool: sell excess positions first,
+        # then buy missing value with the released USDT.
         coin_status = []  # (coin, amount, price, market_value, need_buy, excess_sell)
         total_value = 0.0
         total_need = 0.0
@@ -2153,7 +2168,10 @@ async def _do_rebuild_positions(query, tid, pf_id):
             for e in all_errs[:10]:
                 lines.append(f"• {e}")
             if any("USDT المتاح" in str(e) for e in buy_errors):
-                lines.append("\n💡 حوّل USDT إضافي للحساب ثم أعد *إعادة بناء المراكز*.")
+                lines.append(
+                    "\n💡 تم توزيع القيمة الموجودة بالتساوي؛ لا يوجد شراء إضافي "
+                    "لأن القيمة الحالية أقل من الميزانية الاسمية."
+                )
         report_chunks = _split_telegram_text("\n".join(lines))
         # Edit the progress message with the first part, then send the rest;
         # Telegram rejects messages above its size limit.
