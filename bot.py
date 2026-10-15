@@ -1995,7 +1995,10 @@ async def _do_rebuild_positions(query, tid, pf_id):
                 need = max(0.0, target_per_coin - val)
                 if need >= 1.0:
                     under.append((coin, amt, price, val, need))
-        budget_left = max(0.0, allocated - cur_after) + total_sold_usdt * 0.1
+        # All proceeds from the funding sells are available for the missing
+        # coins. The previous 10% multiplier stranded most of the released
+        # cash and caused false "USDT available" errors.
+        budget_left = max(0.0, allocated - cur_after) + total_sold_usdt
 
         for coin, amt, price, val, need in under:
             # حدّث الرصيد الحر قبل كل شراء
