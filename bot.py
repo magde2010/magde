@@ -254,6 +254,18 @@ def ar_error(exc, context: str = "") -> str:
     return full
 
 
+def _is_silent_reentry_balance_error(error) -> bool:
+    """Automatic re-entry should quietly wait when the exchange has no balance."""
+    text = str(error or "").lower()
+    return any(marker in text for marker in (
+        "30004",
+        "insufficient position",
+        "insufficient balance",
+        "insufficient funds",
+        "not enough balance",
+    ))
+
+
 def get_reb() -> Rebalancer:
     global _reb
     if _reb is None:
@@ -4327,12 +4339,20 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     ),
                 )
                 if buy_res.get("error"):
-                    try:
-                        await context.bot.send_message(
-                            tid, f"⚠️ فشل إعادة دخول `{symbol}`: `{buy_res['error']}`", parse_mode="Markdown"
+                    if _is_silent_reentry_balance_error(buy_res.get("error")):
+                        logger.info(
+                            "Automatic re-entry skipped quietly for %s: exchange balance unavailable",
+                            symbol,
                         )
-                    except Exception:
-                        pass
+                    else:
+                        try:
+                            await context.bot.send_message(
+                                tid,
+                                f"⚠️ فشل إعادة دخول `{symbol}`: `{buy_res['error']}`",
+                                parse_mode="Markdown",
+                            )
+                        except Exception:
+                            pass
                 else:
                     update_coin_position(
                         db, coin.id,
