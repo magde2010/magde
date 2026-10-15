@@ -4371,9 +4371,22 @@ def main():
     if not config.DATABASE_URL:
         raise SystemExit("DATABASE_URL مطلوب")
 
-    if not acquire_singleton_lock():
+    # Railway may briefly keep the old container alive during a rolling deploy.
+    # Wait for its advisory lock to be released instead of exiting immediately
+    # and entering a restart loop with misleading 409 messages.
+    lock_acquired = False
+    for attempt in range(24):
+        if acquire_singleton_lock():
+            lock_acquired = True
+            break
+        logger.warning(
+            "نسخة أخرى تعمل؛ انتظار تحرير قفل Telegram (%s/24)",
+            attempt + 1,
+        )
+        time.sleep(5)
+    if not lock_acquired:
         raise SystemExit(
-            "نسخة أخرى من البوت تعمل بالفعل؛ تم إيقاف هذه النسخة لمنع Telegram 409 Conflict."
+            "تعذر تحرير قفل النسخة القديمة بعد دقيقتين؛ أوقف النسخة القديمة في Railway ثم أعد التشغيل."
         )
 
     init_db()
