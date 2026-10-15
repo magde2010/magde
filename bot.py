@@ -48,6 +48,29 @@ _MONITOR_HEALTH = {
 }
 
 
+def _split_telegram_text(text: str, limit: int = 3800):
+    """Split a report by lines below Telegram's message limit."""
+    chunks = []
+    current = []
+    size = 0
+    for line in str(text).splitlines():
+        line_size = len(line) + 1
+        if current and size + line_size > limit:
+            chunks.append("\n".join(current))
+            current = []
+            size = 0
+        # A single unusually long error line must still be sent safely.
+        while len(line) + 1 > limit:
+            chunks.append(line[: limit - 1])
+            line = line[limit - 1 :]
+        if line or not current:
+            current.append(line)
+            size += len(line) + 1
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [""]
+
+
 def _format_monitor_health(p) -> str:
     """Readable live-health report for the cloud TP/SL monitor."""
     now = time.time()
@@ -2096,11 +2119,21 @@ async def _do_rebuild_positions(query, tid, pf_id):
                 lines.append(f"• {e}")
             if any("USDT المتاح" in str(e) for e in buy_errors):
                 lines.append("\n💡 حوّل USDT إضافي للحساب ثم أعد *إعادة بناء المراكز*.")
+        report_chunks = _split_telegram_text("\n".join(lines))
+        # Edit the progress message with the first part, then send the rest;
+        # Telegram rejects messages above its size limit.
         await query.edit_message_text(
-            "\n".join(lines),
-
-            reply_markup=pf_keyboard(pf_id, True),
+            report_chunks[0],
+            parse_mode="Markdown",
+            reply_markup=pf_keyboard(pf_id, True) if len(report_chunks) == 1 else None,
         )
+        for index, chunk in enumerate(report_chunks[1:], start=1):
+            await context.bot.send_message(
+                tid,
+                chunk,
+                parse_mode="Markdown",
+                reply_markup=pf_keyboard(pf_id, True) if index == len(report_chunks) - 1 else None,
+            )
     except Exception as exc:
         logger.exception("rebuild_positions failed")
         await query.edit_message_text(
