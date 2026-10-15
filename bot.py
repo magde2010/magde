@@ -1938,12 +1938,22 @@ async def _do_rebuild_positions(query, tid, pf_id):
                     )
                     if order is None:
                         continue
-                    total_sold_usdt += sell_value
-                    sold_trim.append(f"{coin.symbol}(-{sell_value:.1f}$)")
-                    required_gap -= sell_value
+                    filled = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda o=order, a=sell_amt, s=coin.symbol: reb._confirm_market_sell(
+                            f"{s}/{client.quote}", o, a
+                        ),
+                    )
+                    filled_value = min(sell_value, max(0.0, float(filled or 0)) * price)
+                    if filled_value < 1.0:
+                        sell_errors.append(f"{coin.symbol}: لم يتأكد تنفيذ البيع التمويلي")
+                        continue
+                    total_sold_usdt += filled_value
+                    sold_trim.append(f"{coin.symbol}(-{filled_value:.1f}$)")
+                    required_gap -= filled_value
                 except Exception as exc:
                     sell_errors.append(f"{coin.symbol}: {exc}")
-            if required_gap < max(0.0, sum(item[4] for item in under) - free_usdt):
+            if total_sold_usdt > 0:
                 await asyncio.sleep(0.8)
                 presence = client.get_portfolio_presence(symbols)
                 free_usdt = client.get_free_usdt()
