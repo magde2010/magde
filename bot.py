@@ -1938,12 +1938,18 @@ async def _do_rebuild_positions(query, tid, pf_id):
         )
 
         free_after = client.get_free_usdt()
-        refreshed_symbols = {str(symbol).split("(", 1)[0] for symbol in refreshed}
-        rebuilt_coins = db.query(PortfolioCoin).filter(
-            PortfolioCoin.portfolio_id == p.id,
-            PortfolioCoin.symbol.in_(refreshed_symbols),
-            PortfolioCoin.remaining_amount > 0,
-        ).all() if refreshed_symbols else []
+        refreshed_symbols = {
+            str(symbol).split("(", 1)[0].strip().upper()
+            for symbol in refreshed
+        }
+        # Symbols entered from Telegram may be mixed-case (e.g. Gm), while
+        # exchange/database rows are commonly uppercase (GM). Match in Python
+        # so the detailed TP/SL section cannot disappear بسبب اختلاف الحالة.
+        rebuilt_coins = [
+            coin for coin in p.coins
+            if str(coin.symbol or "").strip().upper() in refreshed_symbols
+            and float(coin.remaining_amount or 0) > 0
+        ] if refreshed_symbols else []
         # Final report
         lines = [
             f"✅ *تمت إعادة بناء مراكز* `{p.name}`",
