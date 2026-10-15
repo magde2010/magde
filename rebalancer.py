@@ -640,8 +640,11 @@ class Rebalancer:
                     tracked_amount = max(0.0, float(coin.amount or 0))
 
                 try:
-                    # Cancel only TP orders belonging to this tracked position.
-                    # Never cancel another portfolio's sell order for the same symbol.
+                    # Cancel TP orders belonging to this tracked position first.
+                    # Legacy portfolio TP orders may not exist in the database
+                    # anymore. Since portfolio TP is cloud-managed now, any
+                    # remaining open sell for this symbol is stale and must be
+                    # cancelled before the stop can safely release the balance.
                     tracked_tp_orders = {}
                     for key in ("tp_order_id", "tp1_order_id", "tp2_order_id", "tp3_order_id"):
                         order_id = getattr(coin, key, None)
@@ -666,10 +669,18 @@ class Rebalancer:
                             if str(order.get("id") or "") not in tracked_tp_orders
                         ]
                         if unknown:
-                            ids = [str(order.get("id") or "?") for order in unknown[:5]]
-                            raise RuntimeError(
-                                f"Open sell orders remain that are not tracked by this position: {', '.join(ids)}"
-                            )
+                            for order in unknown:
+                                order_id = str(order.get("id") or "")
+                                if not order_id:
+                                    continue
+                                logger.warning(
+                                    "Cancelling stale untracked portfolio sell before SL: %s %s",
+                                    symbol,
+                                    order_id,
+                                )
+                                self.client.cancel_order(
+                                    order_id, f"{symbol}/{self.quote}", strict=False
+                                )
                         if attempt < 3:
                             for order in remaining_sells:
                                 self.client.cancel_order(

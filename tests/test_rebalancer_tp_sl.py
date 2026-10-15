@@ -205,6 +205,27 @@ class PortfolioTakeProfitStopLossTests(unittest.TestCase):
         self.assertEqual(actions[0]["tp_fills"][0]["filled_amount"], 0.3)
         self.assertEqual(client.market_orders[0][2], 0.7)
 
+    def test_stop_loss_cancels_legacy_untracked_sell_orders(self):
+        client = FakeClient()
+        client.price = 89.0
+        client.order_to_create = {
+            "id": "market-sl",
+            "status": "closed",
+            "filled": 1.0,
+            "average": 89.0,
+        }
+        client.free_amounts = [1.0]
+        stale = [{"id": "legacy-1", "side": "sell"}, {"id": "legacy-2", "side": "sell"}]
+        client.fetch_open_sell_orders = lambda symbol: (
+            stale if len(client.cancelled) < len(stale) else []
+        )
+        reb = Rebalancer(client)
+        with patch("rebalancer.time.sleep", return_value=None):
+            actions = reb.check_and_manage_positions([position()])
+        self.assertEqual(actions[0]["action"], "sl_hit_sold")
+        self.assertIn(("legacy-1", "ABC/USDT"), client.cancelled)
+        self.assertIn(("legacy-2", "ABC/USDT"), client.cancelled)
+
     def test_stop_trails_up_after_tp2_and_never_sets_above_market(self):
         client = FakeClient()
         client.price = 120.0
