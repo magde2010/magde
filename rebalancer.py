@@ -189,14 +189,6 @@ class Rebalancer:
                 results["errors"].append(f"`{coin}`: المبلغ أقل من الحد الأدنى ({usdt_for_coin:.2f}$)")
                 continue
             try:
-                import config
-                change = None
-                if hasattr(self.client, "get_ticker_change_pct"):
-                    change = self.client.get_ticker_change_pct(f"{coin}/{self.quote}")
-                max_gain = float(getattr(config, "PORTFOLIO_MAX_ENTRY_GAIN_PCT", 5.0) or 5.0)
-                if change is not None and float(change) > max_gain:
-                    results["errors"].append(f"`{coin}`: تم تخطي الشراء لأن الارتفاع خلال 24 ساعة {float(change):.2f}% أكبر من الحد الآمن {max_gain:.2f}%.")
-                    continue
                 if dry_run:
                     results["executed"].append({
                         "symbol": f"{coin}/{self.quote}",

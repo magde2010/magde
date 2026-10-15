@@ -24,8 +24,6 @@ DEFAULT_THRESHOLD = 2.0
 DEFAULT_MIN_TRADE_USDT = 2.0
 # Fixed portfolio Spot order floor. Never schedule a portfolio order below $2 USDT.
 PORTFOLIO_MIN_ORDER_USDT = 2.0
-# Do not chase a coin that already rose above this percentage in 24 hours.
-PORTFOLIO_MAX_ENTRY_GAIN_PCT = float(os.getenv("PORTFOLIO_MAX_ENTRY_GAIN_PCT", "5.0"))
 # A sell order intentionally leaves a tiny safety buffer, which can remain
 # as dust in the wallet. Balances below this market value are not treated as
 # a real holding during the missing-coin scan.
