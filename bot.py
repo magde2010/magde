@@ -311,7 +311,7 @@ def pf_keyboard(pf_id: int, is_running: bool):
         [ui.button("✂️  تخفيف الحيازة 25% / 50% / 70%", f"trim_menu_{pf_id}")],
         [ui.button("↩  استرجاع الكميات التي تم تخفيفها", f"restore_trim_menu_{pf_id}")],
         [ui.button(f"{ui.I['edit']}  تعديل المبلغ المخصص", f"edit_amount_{pf_id}")],
-        ui.row((f"↻  إعادة بناء", f"rebuild_{pf_id}"), (f"{ui.I['delete']}  حذف", f"delete_pf_{pf_id}")),
+        ui.row(("⚖️  إعادة توازن عام", f"rebalance_{pf_id}"), (f"{ui.I['delete']}  حذف", f"delete_pf_{pf_id}")),
         [ui.button(f"{ui.I['back']}  القائمة الرئيسية", "menu")],
     ]
     return ui.markup(rows)
@@ -1643,7 +1643,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _do_stop_all(query, tid)
         return
 
-    if data.startswith("rebuild_"):
+    if data.startswith(("rebuild_", "rebalance_")):
         await _do_rebuild_positions(query, tid, int(data.split("_")[1]))
         return
 
@@ -3924,7 +3924,7 @@ async def add_coin_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "سيبيع البوت الزيادة من المراكز الحالية ثم يشتري الناقص."
             )
             markup = InlineKeyboardMarkup([
-                [InlineKeyboardButton("⚖️ إعادة توزيع الآن", callback_data=f"rebuild_{pf_id}")],
+                [InlineKeyboardButton("⚖️ إعادة توازن عام الآن", callback_data=f"rebalance_{pf_id}")],
                 [InlineKeyboardButton("↩ المحفظة", callback_data=f"view_{pf_id}")],
             ])
         else:
