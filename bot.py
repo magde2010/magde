@@ -38,6 +38,55 @@ import ui_theme as ui
 from portfolio_controls import calculate_portfolio_entry_budget, calculate_safe_trim_amount, calculate_outstanding_trim_amounts
 
 _SL_FAILURE_ALERTS = {}
+_MONITOR_HEALTH = {
+    "last_finished_at": None,
+    "last_started_at": None,
+    "last_duration": 0.0,
+    "last_positions": 0,
+    "last_actions": 0,
+    "last_error": None,
+}
+
+
+def _format_monitor_health(p) -> str:
+    """Readable live-health report for the cloud TP/SL monitor."""
+    now = time.time()
+    finished = _MONITOR_HEALTH.get("last_finished_at")
+    if not finished:
+        cycle = "⚪ لم تبدأ أي دورة مراقبة بعد"
+    else:
+        age = max(0, int(now - finished))
+        if _MONITOR_HEALTH.get("last_error"):
+            cycle = f"🔴 آخر دورة بها خطأ منذ {age} ثانية"
+        elif age <= max(15, config.STOP_MONITOR_INTERVAL_SECONDS * 3):
+            cycle = f"🟢 آخر دورة ناجحة منذ {age} ثانية"
+        else:
+            cycle = f"🟡 آخر دورة قديمة منذ {age} ثانية"
+    lines = [
+        "☁️ *حالة المراقبة السحابية*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"{cycle}",
+        f"⏱ مدة آخر دورة: `{_MONITOR_HEALTH.get('last_duration', 0):.2f}` ثانية",
+        f"📌 المراكز المفحوصة: `{_MONITOR_HEALTH.get('last_positions', 0)}`",
+        f"🎯 الإجراءات في آخر دورة: `{_MONITOR_HEALTH.get('last_actions', 0)}`",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    error = _MONITOR_HEALTH.get("last_error")
+    lines.append(f"⚠️ الخطأ الأخير: `{str(error)[:160]}`" if error else "✅ لا يوجد خطأ مسجل")
+    lines.extend(["", f"📋 *أهداف واستوب محفظة {p.name}*"])
+    for coin in p.coins or []:
+        status = str(coin.position_status or "idle")
+        tp = []
+        for label, price in (("TP1", coin.tp1_price), ("TP2", coin.tp2_price), ("TP3", coin.tp3_price)):
+            if float(price or 0) > 0:
+                tp.append(f"{label} `{float(price):.8g}`")
+        sl = float(coin.current_sl_price or coin.original_sl_price or 0)
+        lines.append(f"*{coin.symbol.upper()}* — الحالة: `{status}`")
+        lines.append(f"🎯 {' | '.join(tp) if tp else 'لا توجد أهداف'}")
+        lines.append(f"🛡 الاستوب الحالي: `{sl:.8g}`" if sl > 0 else "🛡 الاستوب: غير مضبوط")
+        lines.append("────────────")
+    lines.append("🔄 اضغط تحديث للحصول على قراءة جديدة من قاعدة البيانات.")
+    return "\n".join(lines)
 
 
 def _redact_secrets(value: str) -> str:
@@ -222,6 +271,7 @@ def pf_keyboard(pf_id: int, is_running: bool):
             (f"{ui.I['stop'] if is_running else ui.I['play']}  {'إيقاف' if is_running else 'تشغيل'}", f"toggle_{pf_id}"),
             (f"{ui.I['target']}  الأهداف", f"pf_tpsl_{pf_id}"),
         ),
+        [ui.button("☁️  حالة المراقبة السحابية", f"monitor_health_{pf_id}")],
         ui.row((f"{ui.I['add']}  إضافة عملة", f"addcoin_{pf_id}"), (f"{ui.I['remove']}  إزالة عملة", f"removecoin_{pf_id}")),
         [ui.button("✂️  تخفيف الحيازة 25% / 50% / 70%", f"trim_menu_{pf_id}")],
         [ui.button("↩  استرجاع الكميات التي تم تخفيفها", f"restore_trim_menu_{pf_id}")],
@@ -1159,6 +1209,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         await _do_cleanup(query, context, tid)
+        return
+
+    if data.startswith("monitor_health_"):
+        pf_id = int(data.split("_")[2])
+        db = SessionLocal()
+        try:
+            p = get_portfolio(db, pf_id, tid)
+            if not p:
+                await query.edit_message_text("المحفظة غير موجودة.", reply_markup=main_menu_keyboard())
+                return
+            await query.edit_message_text(
+                _format_monitor_health(p),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 تحديث الحالة", callback_data=f"monitor_health_{pf_id}")],
+                    [InlineKeyboardButton("↩ رجوع للمحفظة", callback_data=f"view_{pf_id}")],
+                ]),
+            )
+        finally:
+            db.close()
         return
 
     if data.startswith("view_") and not data.startswith("view_src_"):
@@ -3743,6 +3813,11 @@ async def increase_amount_msg(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
     """مراقبة مراكز المحافظ وأوامر TP/SL وإعادة الدخول."""
+    cycle_started = time.time()
+    cycle_positions = 0
+    cycle_actions = 0
+    cycle_error = None
+    _MONITOR_HEALTH["last_started_at"] = cycle_started
     db = SessionLocal()
     try:
         positions = get_open_positions(db)
@@ -3756,6 +3831,7 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 int(getattr(position.portfolio, "id", 0) or 0),
             ) not in _ACTIVE_PORTFOLIO_TRIMS
         ]
+        cycle_positions = len(positions)
         if not positions:
             return
         # PortfolioCoin has no TP sell-percentage columns. Resolve settings
@@ -3833,6 +3909,7 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
             None, lambda: reb.check_and_manage_positions(price_positions)
         )
         actions = manual_tp_actions + cloud_tp_actions + price_actions
+        cycle_actions = len(actions)
         if actions:
             logger.info(
                 "[MONITOR] actions=%s types=%s",
@@ -4357,9 +4434,17 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     )
                 except Exception:
                     pass
-    except Exception:
+    except Exception as exc:
+        cycle_error = str(exc)
         logger.exception("monitor_positions_job error")
     finally:
+        _MONITOR_HEALTH.update(
+            last_finished_at=time.time(),
+            last_duration=max(0.0, time.time() - cycle_started),
+            last_positions=cycle_positions,
+            last_actions=cycle_actions,
+            last_error=cycle_error,
+        )
         db.close()
 
 
