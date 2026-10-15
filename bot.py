@@ -1907,6 +1907,59 @@ async def _do_rebuild_positions(query, tid, pf_id):
             if need >= 1.0:
                 under.append((coin, amt, price, val, need))
 
+        # Small excesses can be scattered across many positions and each one
+        # may be below the normal trim threshold. If that leaves the missing
+        # coin unfunded, release the gap from the largest existing positions.
+        required_gap = max(0.0, sum(item[4] for item in under) - free_usdt)
+        if required_gap >= 1.0:
+            under_symbols = {item[0].symbol for item in under}
+            candidates = []
+            for coin in p.coins:
+                if coin.symbol in under_symbols:
+                    continue
+                info = presence.get(coin.symbol) or presence.get(coin.symbol.upper()) or {}
+                val = float(info.get("market_value") or 0)
+                price = float(info.get("price") or 0)
+                if val >= 2.0 and price > 0:
+                    candidates.append((val, coin, price))
+            for val, coin, price in sorted(candidates, reverse=True, key=lambda item: item[0]):
+                if required_gap < 1.0:
+                    break
+                sell_value = min(required_gap, max(0.0, val - 1.0))
+                if sell_value < 1.0:
+                    continue
+                sell_amt = (sell_value / price) * 0.998
+                try:
+                    order = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda s=coin.symbol, a=sell_amt: client.create_market_order(
+                            f"{s}/{client.quote}", "sell", a
+                        ),
+                    )
+                    if order is None:
+                        continue
+                    total_sold_usdt += sell_value
+                    sold_trim.append(f"{coin.symbol}(-{sell_value:.1f}$)")
+                    required_gap -= sell_value
+                except Exception as exc:
+                    sell_errors.append(f"{coin.symbol}: {exc}")
+            if required_gap < max(0.0, sum(item[4] for item in under) - free_usdt):
+                await asyncio.sleep(0.8)
+                presence = client.get_portfolio_presence(symbols)
+                free_usdt = client.get_free_usdt()
+                under = []
+                for coin in p.coins:
+                    info = presence.get(coin.symbol) or presence.get(coin.symbol.upper()) or {}
+                    val = float(info.get("market_value") or 0)
+                    amt = float(info.get("amount") or 0)
+                    price = float(info.get("price") or 0)
+                    if amt <= 0 or val < min_usdt:
+                        val = 0.0
+                        amt = 0.0
+                    need = max(0.0, target_per_coin - val)
+                    if need >= 1.0:
+                        under.append((coin, amt, price, val, need))
+
         # 3ب) تكميل الناقص — لا نتجاوز المخصص الإجمالي تقريبًا
         bought = []
         topped = []
@@ -1920,6 +1973,28 @@ async def _do_rebuild_positions(query, tid, pf_id):
             )
         except Exception:
             cur_after = total_value - total_sold_usdt
+        # Selling excess can change the available pool. Recompute the equal
+        # share now, otherwise a missing coin can still use the old nominal
+        # target and incorrectly report that extra USDT is required.
+        post_sale_pool = max(0.0, cur_after) + max(0.0, free_usdt)
+        post_sale_target = (
+            min(configured_target_per_coin, post_sale_pool / n_coins)
+            if n_coins > 0 else 0.0
+        )
+        if post_sale_target < target_per_coin:
+            target_per_coin = post_sale_target
+            under = []
+            for coin in p.coins:
+                info = presence.get(coin.symbol) or presence.get(coin.symbol.upper()) or {}
+                val = float(info.get("market_value") or 0)
+                amt = float(info.get("amount") or 0)
+                price = float(info.get("price") or 0)
+                if amt <= 0 or val < min_usdt:
+                    val = 0.0
+                    amt = 0.0
+                need = max(0.0, target_per_coin - val)
+                if need >= 1.0:
+                    under.append((coin, amt, price, val, need))
         budget_left = max(0.0, allocated - cur_after) + total_sold_usdt * 0.1
 
         for coin, amt, price, val, need in under:
