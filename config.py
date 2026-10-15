@@ -34,5 +34,5 @@ QUOTE_ASSET = "USDT"
 # Fast cloud polling for the software stop-loss. Five seconds is the minimum
 # allowed value to avoid excessive exchange API requests.
 STOP_MONITOR_INTERVAL_SECONDS = max(
-    5.0, float(os.getenv("STOP_MONITOR_INTERVAL_SECONDS", "10"))
+    5.0, float(os.getenv("STOP_MONITOR_INTERVAL_SECONDS", "5"))
 )

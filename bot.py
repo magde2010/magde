@@ -2665,7 +2665,10 @@ async def _do_trim_holdings(query, tid, pf_id, pct):
                     tp2_price=tr.get("tp2_price", coin_obj.tp2_price),
                     tp3_price=tr.get("tp3_price", coin_obj.tp3_price),
                     tp_price=tr.get("tp1_price", coin_obj.tp_price),
-                    current_sl_price=tr.get("sl_price", coin_obj.current_sl_price),
+                    current_sl_price=max(
+                        float(coin_obj.current_sl_price or 0),
+                        float(tr.get("sl_price") or 0),
+                    ),
                     tp1_order_id=tr.get("tp1_order_id"),
                     tp2_order_id=tr.get("tp2_order_id"),
                     tp3_order_id=tr.get("tp3_order_id"),
@@ -2682,14 +2685,14 @@ async def _do_trim_holdings(query, tid, pf_id, pct):
             if not symbol or tracked <= 0:
                 continue
 
-            # The wallet is shared across portfolios; do not manually trim an asset
-            # whose holding is tracked by another running portfolio.
+            # The wallet is shared across portfolios; protect tracked holdings
+            # even when their portfolio is currently paused.
             other = db.query(PortfolioCoin).join(Portfolio).filter(
                 PortfolioCoin.symbol == symbol,
                 PortfolioCoin.portfolio_id != p.id,
                 Portfolio.telegram_id == tid,
                 Portfolio.status == "active",
-                Portfolio.is_running == True,
+                PortfolioCoin.remaining_amount > 0,
             ).first()
             if other:
                 skipped_shared.append(symbol)
@@ -2732,15 +2735,32 @@ async def _do_trim_holdings(query, tid, pf_id, pct):
                 try:
                     await loop.run_in_executor(None, lambda o=oid, s=symbol: client.cancel_order(o, f"{s}/{client.quote}", strict=True))
                 except Exception:
-                    state = await loop.run_in_executor(None, lambda o=oid, s=symbol: client.fetch_order(o, f"{s}/{client.quote}"))
-                    status = str((state or {}).get("status") or "").lower()
-                    filled_on_order = float((state or {}).get("filled") or 0)
-                    if status in {"closed", "filled"} and filled_on_order > 0:
-                        cancel_problem = f"أمر TP `{oid}` يبدو أنه نُفّذ بالفعل؛ حدّث حالة المركز ثم أعد المحاولة"
-                        break
-                    if status not in {"closed", "canceled", "cancelled", "expired", "rejected"}:
-                        cancel_problem = f"لم أستطع تأكيد إلغاء أمر TP `{oid}`"
-                        break
+                    pass
+                try:
+                    state = await loop.run_in_executor(
+                        None, lambda o=oid, s=symbol: client.fetch_order(o, f"{s}/{client.quote}")
+                    )
+                except Exception:
+                    state = None
+                status = str((state or {}).get("status") or "").lower()
+                try:
+                    raw_filled = (state or {}).get("filled")
+                    filled_on_order = (
+                        float(raw_filled) if raw_filled is not None else -1.0
+                    )
+                except (TypeError, ValueError):
+                    filled_on_order = -1.0
+                if status not in {"closed", "filled", "canceled", "cancelled", "expired", "rejected"}:
+                    cancel_problem = f"لم أستطع تأكيد الحالة النهائية لأمر TP `{oid}`"
+                    break
+                if filled_on_order < 0:
+                    cancel_problem = f"لم أستطع تأكيد الكمية المنفذة لأمر TP `{oid}`"
+                    break
+                if filled_on_order > 0:
+                    cancel_problem = (
+                        f"أمر TP `{oid}` نُفّذ منه جزء أو كله؛ انتظر مزامنة المراقب ثم أعد المحاولة"
+                    )
+                    break
             if cancel_problem:
                 results.append(f"⚠️ `{symbol}`: {cancel_problem}؛ لم يتم البيع.")
                 continue
@@ -2811,6 +2831,7 @@ async def _do_trim_holdings(query, tid, pf_id, pct):
                 remaining = max(0.0, tracked - fill_amount)
                 update_coin_position(
                     db, coin.id,
+                    amount=remaining,
                     remaining_amount=remaining,
                     position_status=("closed" if remaining <= max(tracked * 1e-6, 1e-12) else coin.position_status),
                     tp_order_id=None,
@@ -2826,6 +2847,9 @@ async def _do_trim_holdings(query, tid, pf_id, pct):
                     )
                 except Exception:
                     logger.exception("record manual trim %s", symbol)
+                    results.append(
+                        f"⚠️ `{symbol}`: تم البيع وتحديث المركز، لكن تعذر حفظ سجل التخفيف؛ لا تستخدم الاسترجاع قبل مراجعة السجل."
+                    )
 
                 # Re-create target orders only if this portfolio is still running
                 # and the position remains open. Amount/remaining tracking is not
@@ -2939,7 +2963,10 @@ async def _do_restore_trimmed(query, tid, pf_id, pct):
                     tp2_price=trade.get("tp2_price", coin_obj.tp2_price),
                     tp3_price=trade.get("tp3_price", coin_obj.tp3_price),
                     tp_price=trade.get("tp1_price", coin_obj.tp_price),
-                    current_sl_price=trade.get("sl_price", coin_obj.current_sl_price),
+                    current_sl_price=max(
+                        float(coin_obj.current_sl_price or 0),
+                        float(trade.get("sl_price") or 0),
+                    ),
                     tp1_order_id=trade.get("tp1_order_id"),
                     tp2_order_id=trade.get("tp2_order_id"),
                     tp3_order_id=trade.get("tp3_order_id"),
@@ -2966,7 +2993,7 @@ async def _do_restore_trimmed(query, tid, pf_id, pct):
                 PortfolioCoin.portfolio_id != pf.id,
                 Portfolio.telegram_id == tid,
                 Portfolio.status == "active",
-                Portfolio.is_running == True,
+                PortfolioCoin.remaining_amount > 0,
             ).first()
             if other:
                 skipped_shared.append(symbol)
@@ -2999,13 +3026,32 @@ async def _do_restore_trimmed(query, tid, pf_id, pct):
                     try:
                         await loop.run_in_executor(None, lambda o=oid, s=pair: client.cancel_order(o, s, strict=True))
                     except Exception:
-                        state = await loop.run_in_executor(None, lambda o=oid, s=pair: client.fetch_order(o, s))
-                        status = str((state or {}).get("status") or "").lower()
-                        if status not in {"closed", "canceled", "cancelled", "expired", "rejected"}:
-                            cancel_failed = True
-                            break
+                        pass
+                    try:
+                        state = await loop.run_in_executor(
+                            None, lambda o=oid, s=pair: client.fetch_order(o, s)
+                        )
+                    except Exception:
+                        state = None
+                    status = str((state or {}).get("status") or "").lower()
+                    try:
+                        raw_filled = (state or {}).get("filled")
+                        filled_on_order = (
+                            float(raw_filled) if raw_filled is not None else -1.0
+                        )
+                    except (TypeError, ValueError):
+                        filled_on_order = -1.0
+                    if status not in {"closed", "filled", "canceled", "cancelled", "expired", "rejected"}:
+                        cancel_failed = True
+                        break
+                    if filled_on_order != 0:
+                        cancel_failed = True
+                        break
                 if cancel_failed:
-                    results.append(f"⚠️ `{symbol}`: تعذر تأكيد إلغاء هدف بيع قديم؛ لم يتم الشراء.")
+                    results.append(
+                        f"⚠️ `{symbol}`: تعذر إثبات إلغاء TP بدون تنفيذ؛ لم يتم الشراء. "
+                        "انتظر مزامنة المراقب أو راجع سجل MEXC قبل إعادة المحاولة."
+                    )
                     continue
                 if order_ids:
                     update_coin_position(db, coin.id, tp_order_id=None, tp1_order_id=None, tp2_order_id=None, tp3_order_id=None)
@@ -3043,10 +3089,9 @@ async def _do_restore_trimmed(query, tid, pf_id, pct):
                 old_entry = max(0.0, float(coin.entry_price or 0.0))
                 new_remaining = old_remaining + fill_amount
                 avg_entry = ((old_remaining * old_entry) + (fill_amount * fill_price)) / new_remaining if new_remaining > 0 else fill_price
-                total_amount = max(float(coin.amount or 0.0), new_remaining)
                 update_coin_position(
                     db, coin.id,
-                    amount=total_amount,
+                    amount=new_remaining,
                     remaining_amount=new_remaining,
                     entry_price=avg_entry,
                     position_status="open",
@@ -3634,8 +3679,49 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
     db = SessionLocal()
     try:
         positions = get_open_positions(db)
+        # A manual trim/restore owns its portfolio balance while in flight.
+        # Avoid a concurrent monitor sell/buy against the same tracked quantity;
+        # the next polling cycle resumes monitoring after the operation ends.
+        positions = [
+            position for position in positions
+            if (
+                int(getattr(position.portfolio, "telegram_id", 0) or 0),
+                int(getattr(position.portfolio, "id", 0) or 0),
+            ) not in _ACTIVE_PORTFOLIO_TRIMS
+        ]
         if not positions:
             return
+        # PortfolioCoin has no TP sell-percentage columns. Resolve settings
+        # from its portfolio (then user defaults) and cache them on this
+        # in-memory snapshot before handing it to the synchronous monitor.
+        settings_by_user = {}
+
+        def _resolved_sell_pct(portfolio_value, user_value):
+            for value in (portfolio_value, user_value):
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if number > 0:
+                    return min(100.0, number)
+            return 40.0
+
+        for position in positions:
+            portfolio = getattr(position, "portfolio", None)
+            owner_id = int(
+                getattr(portfolio, "telegram_id", None) or config.ADMIN_TELEGRAM_ID
+            )
+            if owner_id not in settings_by_user:
+                settings_by_user[owner_id] = get_or_create_user(db, owner_id)
+            user_settings = settings_by_user[owner_id]
+            position._monitor_tp1_sell_pct = _resolved_sell_pct(
+                getattr(portfolio, "tp1_sell_pct", None),
+                getattr(user_settings, "tp1_sell_pct", None),
+            )
+            position._monitor_tp2_sell_pct = _resolved_sell_pct(
+                getattr(portfolio, "tp2_sell_pct", None),
+                getattr(user_settings, "tp2_sell_pct", None),
+            )
         logger.info(
             "[MONITOR] open_positions=%s symbols=%s",
             len(positions),
@@ -3644,8 +3730,23 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
         # Run sync CCXT work off the event loop so Telegram stays responsive
         loop = asyncio.get_event_loop()
         reb = get_reb()
+        # Exchange-hosted TP orders must be reconciled before local/cloud
+        # targets are considered. Otherwise the bot can market-sell the same
+        # TP slice that MEXC has already filled.
+        manual_tp_actions = await loop.run_in_executor(
+            None, lambda: reb.sync_manual_tp_orders(positions)
+        )
+        manual_handled_ids = {
+            action.get("coin_id")
+            for action in manual_tp_actions
+            if action.get("coin_id") is not None
+        }
+        cloud_positions = [
+            position for position in positions
+            if getattr(position, "id", None) not in manual_handled_ids
+        ]
         cloud_tp_actions = await loop.run_in_executor(
-            None, lambda: reb.sync_cloud_tp(positions)
+            None, lambda: reb.sync_cloud_tp(cloud_positions)
         )
         # Cloud TP changes the same position that the price/SL pass reads.
         # Exclude those coins from this cycle's stale snapshot to prevent a
@@ -3659,11 +3760,12 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
         price_positions = [
             position for position in positions
             if getattr(position, "id", None) not in cloud_handled_ids
+            and getattr(position, "id", None) not in manual_handled_ids
         ]
         price_actions = await loop.run_in_executor(
             None, lambda: reb.check_and_manage_positions(price_positions)
         )
-        actions = cloud_tp_actions + price_actions
+        actions = manual_tp_actions + cloud_tp_actions + price_actions
         if actions:
             logger.info(
                 "[MONITOR] actions=%s types=%s",
@@ -3688,10 +3790,83 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
             pf = coin.portfolio
             tid = pf.telegram_id if pf else config.ADMIN_TELEGRAM_ID
 
+            def record_reconciled_tp_fills(fills):
+                """Persist limit-order fills discovered during an SL cancel race."""
+                for fill in fills or []:
+                    amount = max(0.0, float(fill.get("filled_amount") or 0))
+                    fill_price = float(fill.get("fill_price") or 0)
+                    if amount <= 0 or fill_price <= 0 or not pf:
+                        continue
+                    stage = str(fill.get("stage") or "tp")
+                    entry_price = float(coin.entry_price or 0)
+                    record_trade_event(
+                        db, tid, pf.id, coin.id, symbol, stage,
+                        entry_price, fill_price, amount,
+                        (fill_price - entry_price) * amount,
+                        details="TP limit fill reconciled while cancelling for stop loss",
+                    )
+
+            def clear_cancelled_tp_ids(order_ids):
+                wanted = {str(order_id) for order_id in (order_ids or [])}
+                updates = {
+                    key: None
+                    for key in ("tp_order_id", "tp1_order_id", "tp2_order_id", "tp3_order_id")
+                    if getattr(coin, key, None) and str(getattr(coin, key)) in wanted
+                }
+                if updates:
+                    update_coin_position(db, coin.id, **updates)
+
             if act["action"] == "manual_tp_order_cleared":
                 key = act.get("clear_order_key")
                 if key in ("tp1_order_id", "tp2_order_id", "tp3_order_id"):
                     update_coin_position(db, coin.id, **{key: None})
+                continue
+
+            if act["action"] == "sl_trail_updated":
+                update_coin_position(
+                    db, coin.id,
+                    current_sl_price=float(act.get("new_sl") or coin.current_sl_price or 0),
+                )
+                continue
+
+            if act["action"] == "manual_tp_partial":
+                remaining_before = max(
+                    0.0, float(coin.remaining_amount or coin.amount or 0)
+                )
+                filled_amount = min(
+                    remaining_before, max(0.0, float(act.get("filled_amount") or 0))
+                )
+                fill_price = float(act.get("fill_price") or act.get("price") or 0)
+                entry_price = float(coin.entry_price or 0)
+                if filled_amount > 0 and fill_price > 0 and pf:
+                    record_trade_event(
+                        db, tid, pf.id, coin.id, symbol, act.get("stage") or "tp",
+                        entry_price, fill_price, filled_amount,
+                        (fill_price - entry_price) * filled_amount,
+                        details="Cancelled TP limit order had a partial fill",
+                    )
+                key = act.get("clear_order_key")
+                updates = {
+                    "remaining_amount": max(0.0, remaining_before - filled_amount),
+                }
+                # Once a cancelled TP has any confirmed fill, treat that stage
+                # as consumed. This avoids re-selling its already-filled slice
+                # through the local fallback target.
+                if act.get("stage") == "tp1":
+                    updates["position_status"] = "tp1_hit"
+                    updates["current_sl_price"] = max(
+                        float(coin.current_sl_price or 0),
+                        float(coin.entry_price or 0),
+                    )
+                elif act.get("stage") == "tp2":
+                    updates["position_status"] = "tp2_hit"
+                    updates["current_sl_price"] = max(
+                        float(coin.current_sl_price or 0),
+                        float(coin.tp1_price or coin.entry_price or 0),
+                    )
+                if key in ("tp1_order_id", "tp2_order_id", "tp3_order_id"):
+                    updates[key] = None
+                update_coin_position(db, coin.id, **updates)
                 continue
 
             if act["action"] == "tp_full_close":
@@ -3700,7 +3875,13 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 fill_price = float(act.get("fill_price") or act.get("price") or 0)
                 stage = act.get("stage") or "tp"
                 filled_amount = float(act.get("filled_amount") or remaining_before or 0)
-                if remaining_before > 0 and fill_price and float(coin.entry_price or 0) > 0:
+                record_reconciled_tp_fills(act.get("tp_fills"))
+                if (
+                    not act.get("tp_fills")
+                    and remaining_before > 0
+                    and fill_price
+                    and float(coin.entry_price or 0) > 0
+                ):
                     pnl = (fill_price - float(coin.entry_price)) * min(filled_amount, remaining_before)
                     record_trade_event(
                         db, tid, pf.id, coin.id, symbol, "balance_sync",
@@ -3766,16 +3947,13 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     update_coin_position(
                         db, coin.id,
                         position_status="tp1_hit",
-                        current_sl_price=(
-                            float(act.get("new_sl") or coin.entry_price or 0)
-                            if True
-                            else coin.entry_price
-                        ) or coin.entry_price,
+                        current_sl_price=float(
+                            act.get("new_sl") or coin.entry_price or 0
+                        ),
                         remaining_amount=new_rem,
                         tp1_order_id=None,
                     )
-                    manual_mode = True
-                    tp1_protection = "الاستوب اليدوي ظل ثابتاً" if manual_mode else f"تم نقل الاستوب إلى سعر الدخول `{coin.entry_price:.6g}`"
+                    tp1_protection = f"تم نقل الاستوب إلى سعر الدخول `{coin.entry_price:.6g}`"
                     msg = (
                         f"🎯 *تحقق الهدف 1* — `{symbol}`\n"
                         f"السعر: `{act['price']:.6g}`\n"
@@ -3828,17 +4006,16 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     update_coin_position(
                         db, coin.id,
                         position_status="tp2_hit",
-                        current_sl_price=(
-                            coin.current_sl_price
-                            if True
-                            else act["new_sl"]
+                        current_sl_price=float(
+                            act.get("new_sl") or coin.current_sl_price or 0
                         ),
                         remaining_amount=new_rem,
                         tp2_order_id=None,
                     )
-                    manual_mode = True
-                    tp2_protection = "الاستوب اليدوي ظل ثابتاً" if manual_mode else f"تم رفع الاستوب لحماية الربح إلى `{act['new_sl']:.6g}`"
-                    tp2_mode = "(الجزء المتبقي يعمل بالأهداف اليدوية)" if manual_mode else "(الجزء المتبقي يعمل بالأهداف اليدوية)"
+                    tp2_protection = (
+                        f"تم رفع الاستوب إلى `{float(act.get('new_sl') or 0):.6g}`"
+                    )
+                    tp2_mode = "(الجزء المتبقي محمي باستوب متحرك)"
                     msg = (
                         f"🎯 *تحقق الهدف 2* — `{symbol}`\n"
                         f"السعر: `{act['price']:.6g}`\n"
@@ -3989,6 +4166,7 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                         pass
 
             elif act["action"] == "sl_sell_partial":
+                record_reconciled_tp_fills(act.get("tp_fills"))
                 filled_amount = float(act.get("filled_amount") or 0)
                 remaining_amount = float(act.get("remaining_amount") or 0)
                 exit_price = float(act.get("price") or 0)
@@ -4003,10 +4181,11 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     )
                 update_coin_position(
                     db, coin.id,
-                    position_status="open",
+                    position_status=act.get("position_status") or coin.position_status,
                     remaining_amount=remaining_amount,
                     current_sl_price=float(act.get("sl") or coin.current_sl_price or 0),
                 )
+                clear_cancelled_tp_ids(act.get("cancelled_tp_order_ids"))
                 try:
                     await context.bot.send_message(
                         tid,
@@ -4017,6 +4196,7 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     pass
 
             elif act["action"] == "sl_hit_sold":
+                record_reconciled_tp_fills(act.get("tp_fills"))
                 exit_price = float(act.get("price") or 0)
                 stopped_amount = float(act.get("amount") or 0)
                 entry_price = float(coin.entry_price or 0)
@@ -4078,6 +4258,25 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     pass
 
             elif act["action"] == "sl_sell_failed":
+                if act.get("cancelled_tp_order_ids") is not None:
+                    record_reconciled_tp_fills(act.get("tp_fills"))
+                    if act.get("manual_reconciliation_required"):
+                        # Freeze this row out of automatic SL retries rather
+                        # than risking a second sale against inconsistent
+                        # exchange/database quantities.
+                        update_coin_position(
+                            db, coin.id, position_status="reconcile_required"
+                        )
+                    else:
+                        update_coin_position(
+                            db, coin.id,
+                            position_status=act.get("position_status") or coin.position_status,
+                            remaining_amount=max(
+                                0.0,
+                                float(act.get("remaining_amount") or 0),
+                            ),
+                        )
+                    clear_cancelled_tp_ids(act.get("cancelled_tp_order_ids"))
                 alert_key=(tid, getattr(act, "coin_id", None) if not isinstance(act, dict) else act.get("coin_id"), symbol)
                 now=time.time()
                 if now-_SL_FAILURE_ALERTS.get(alert_key, 0) < 60:

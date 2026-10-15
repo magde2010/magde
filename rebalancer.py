@@ -92,6 +92,33 @@ class Rebalancer:
             raise RuntimeError(f"لم تؤكد MEXC تنفيذ بيع وقف الخسارة (order={order_id or 'بدون رقم'})")
         return min(filled, float(requested))
 
+    def _sell_prices(self, symbols: List[str]) -> Dict[str, float]:
+        """Prefer executable best-bid prices, with compatibility fallback."""
+        getter = getattr(self.client, "get_all_sell_prices", None)
+        try:
+            if callable(getter):
+                return getter(symbols) or {}
+            return self.client.get_all_prices(symbols) or {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _tp_sell_pct(coin: Any, stage: str) -> float:
+        """Resolve the TP slice without assuming it is a PortfolioCoin column."""
+        name = f"tp{1 if stage == 'tp1' else 2}_sell_pct"
+        for source, key in (
+            (coin, f"_monitor_{name}"),
+            (coin, name),  # compatibility for legacy/test objects
+            (getattr(coin, "portfolio", None), name),
+        ):
+            value = getattr(source, key, None) if source is not None else None
+            if value is not None:
+                try:
+                    return max(0.0, min(100.0, float(value)))
+                except (TypeError, ValueError):
+                    pass
+        return 40.0
+
     def fetch_candles(self, symbol: str, timeframe: str = "1h", limit: int = 80) -> List:
         pair = f"{symbol}/{self.quote}"
         try:
@@ -313,7 +340,9 @@ class Rebalancer:
             # اليدوي يستخدم هدفين فقط؛ الـ20% الباقية تُدار بوقف متحرك.
             tp3_price = 0.0
             order_ids = {"tp1_order_id": None, "tp2_order_id": None, "tp3_order_id": None}
-            if item.get("place_exchange_orders", True):
+            # Portfolio targets are monitored locally by sync_cloud_tp.
+            # Exchange limit orders are opt-in only for legacy/manual uses.
+            if item.get("place_exchange_orders", False):
                 sell1 = float(item.get("tp1_sell_pct_override", tp1_sell_pct) or 0)
                 sell2 = float(item.get("tp2_sell_pct_override", tp2_sell_pct) or 0)
                 if min(tp1_price, tp2_price) <= 0 or sell1 <= 0 or sell2 <= 0 or sell1 + sell2 >= 100.0:
@@ -421,16 +450,40 @@ class Rebalancer:
             order_id = getattr(coin, key, None)
             if not order_id:
                 continue
-            order = self.client.fetch_order(order_id, coin.symbol)
+            try:
+                order = self.client.fetch_order(order_id, coin.symbol)
+            except Exception as exc:
+                # A temporary status-read failure must not stop the separate
+                # price/SL monitor for every position.
+                logger.warning("manual TP status read failed %s %s: %s", coin.symbol, order_id, exc)
+                continue
             order_status = str((order or {}).get("status") or "").lower()
             if order_status in ("canceled", "cancelled", "rejected", "expired"):
-                # Let the normal manual monitor take over on the next line;
-                # the DB cleanup is persisted by the monitor job.
                 setattr(coin, key, None)
-                actions.append({
-                    "coin_id": getattr(coin, "id", None), "symbol": coin.symbol,
-                    "action": "manual_tp_order_cleared", "clear_order_key": key,
-                })
+                filled = float((order or {}).get("filled") or 0)
+                remaining = float(coin.remaining_amount or coin.amount or 0)
+                filled = min(max(0.0, filled), max(0.0, remaining))
+                if filled > 0:
+                    price = float(
+                        (order or {}).get("average")
+                        or (order or {}).get("price")
+                        or fallback_price
+                        or 0
+                    )
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None),
+                        "symbol": coin.symbol,
+                        "action": "manual_tp_partial",
+                        "stage": stage,
+                        "filled_amount": filled,
+                        "fill_price": price,
+                        "clear_order_key": key,
+                    })
+                else:
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None), "symbol": coin.symbol,
+                        "action": "manual_tp_order_cleared", "clear_order_key": key,
+                    })
                 continue
             if order_status not in ("closed", "filled"):
                 continue
@@ -445,7 +498,10 @@ class Rebalancer:
             if stage == "tp1":
                 new_sl = entry
             elif stage == "tp2":
-                new_sl = max(float(coin.current_sl_price or 0), tp1_px if tp1_px > 0 else entry)
+                new_sl = max(
+                    float(coin.current_sl_price or 0),
+                    tp1_px if tp1_px > 0 else entry,
+                )
             else:
                 new_sl = float(coin.current_sl_price or 0)
             actions.append({
@@ -464,13 +520,23 @@ class Rebalancer:
         active = [c for c in positions if (c.position_status or "open") in ("open", "tp1_hit")]
         if not active:
             return actions
-        prices = self.client.get_all_prices(list({c.symbol for c in active})) or {}
+        prices = self._sell_prices(list({c.symbol for c in active}))
         for coin in active:
             status = str(coin.position_status or "open")
             if status == "open":
-                stage, target, sell_pct = "tp1", float(coin.tp1_price or 0), float(coin.tp1_sell_pct or 0)
+                stage, target, sell_pct, order_key = (
+                    "tp1", float(coin.tp1_price or 0),
+                    self._tp_sell_pct(coin, "tp1"), "tp1_order_id",
+                )
             else:
-                stage, target, sell_pct = "tp2", float(coin.tp2_price or 0), float(coin.tp2_sell_pct or 0)
+                stage, target, sell_pct, order_key = (
+                    "tp2", float(coin.tp2_price or 0),
+                    self._tp_sell_pct(coin, "tp2"), "tp2_order_id",
+                )
+            # Exchange limit orders are the source of truth for this stage.
+            # Never send a second market sell for the same TP.
+            if getattr(coin, order_key, None):
+                continue
             price = float(prices.get(coin.symbol) or prices.get(f"{coin.symbol}/{self.quote}") or 0)
             if target <= 0 or sell_pct <= 0 or price < target:
                 continue
@@ -484,10 +550,21 @@ class Rebalancer:
                 if not order:
                     raise RuntimeError("Exchange rejected the cloud TP amount")
                 fill_price = float(order.get("average") or order.get("price") or price)
-                self._confirm_market_sell(f"{coin.symbol}/{self.quote}", order, amount)
+                filled = self._confirm_market_sell(
+                    f"{coin.symbol}/{self.quote}", order, amount
+                )
                 actions.append({"coin_id": getattr(coin, "id", None), "symbol": coin.symbol,
                                 "action": f"{stage}_hit", "price": fill_price, "fill_price": fill_price,
-                                "filled_amount": amount, "new_sl": float(coin.current_sl_price or 0),
+                                "filled_amount": filled, "requested_amount": amount,
+                                "partial_fill": filled + max(amount * 1e-6, 1e-12) < amount,
+                                "new_sl": (
+                                    float(coin.entry_price or 0)
+                                    if stage == "tp1"
+                                    else max(
+                                        float(coin.current_sl_price or 0),
+                                        float(coin.tp1_price or coin.entry_price or 0),
+                                    )
+                                ),
                                 "enable_trail": stage == "tp2", "cloud_tp": True})
             except Exception as exc:
                 logger.warning("cloud TP failed %s %s: %s", coin.symbol, stage, exc)
@@ -500,7 +577,7 @@ class Rebalancer:
         1) لو الرصيد ≈ 0 → إغلاق
         2) لو waiting_reentry والسعر ≥ سعر إعادة الدخول → إشارة شراء (متكرر، مش مرة واحدة)
         3) لو السعر ≤ الاستوب → بيع سوق + waiting_reentry
-        4) الاستوب اليدوي ثابت، وإعادة الدخول اختيارية بعد تأكيد المستخدم
+        4) الاستوب ثابت قبل TP2، ثم يتحرك صعوداً فقط لحماية الجزء المتبقي
         """
         import time
         actions = []
@@ -514,10 +591,7 @@ class Rebalancer:
             return actions
 
         symbols = list({c.symbol for c in active})
-        try:
-            prices = self.client.get_all_prices(symbols) or {}
-        except Exception:
-            prices = {}
+        prices = self._sell_prices(symbols)
 
         now = time.time()
         # تبريد إعادة الدخول في الذاكرة (per process)
@@ -573,6 +647,30 @@ class Rebalancer:
                     continue
                 self._balance_zero_streak.pop(symbol, None)
 
+            # ----- Ratcheting trailing stop for the residual after TP2 -----
+            # The current stop is the persisted high-water mark: it may rise
+            # as price rises, but it can never move back down.
+            if status == "tp2_hit" and sl > 0 and price > sl:
+                portfolio = getattr(coin, "portfolio", None)
+                configured_trail = getattr(portfolio, "trail_pct", None)
+                try:
+                    trail_pct = float(configured_trail)
+                except (TypeError, ValueError):
+                    trail_pct = 0.0
+                if trail_pct <= 0:
+                    trail_pct = 2.0
+                trailing_sl = price * (1.0 - trail_pct / 100.0)
+                if trailing_sl > sl:
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None),
+                        "symbol": symbol,
+                        "action": "sl_trail_updated",
+                        "old_sl": sl,
+                        "new_sl": trailing_sl,
+                        "price": price,
+                    })
+                    sl = trailing_sl
+
             # ----- إعادة دخول متكررة (سلسة) -----
             if status == "waiting_reentry":
                 reentry_px = float(getattr(coin, "reentry_price", 0) or 0)
@@ -618,11 +716,11 @@ class Rebalancer:
                 try:
                     # Cancel only TP orders belonging to this tracked position.
                     # Never cancel another portfolio's sell order for the same symbol.
-                    tracked_tp_ids = set()
+                    tracked_tp_orders = {}
                     for key in ("tp_order_id", "tp1_order_id", "tp2_order_id", "tp3_order_id"):
                         order_id = getattr(coin, key, None)
                         if order_id:
-                            tracked_tp_ids.add(str(order_id))
+                            tracked_tp_orders[str(order_id)] = key
                             self.client.cancel_order(
                                 str(order_id), f"{symbol}/{self.quote}", strict=False
                             )
@@ -639,7 +737,7 @@ class Rebalancer:
                             break
                         unknown = [
                             order for order in remaining_sells
-                            if str(order.get("id") or "") not in tracked_tp_ids
+                            if str(order.get("id") or "") not in tracked_tp_orders
                         ]
                         if unknown:
                             ids = [str(order.get("id") or "?") for order in unknown[:5]]
@@ -656,6 +754,42 @@ class Rebalancer:
                         raise RuntimeError(
                             f"Open tracked sell orders remain after repeated TP cancellation: {', '.join(ids)}"
                         )
+
+                    # A limit TP may have partially filled just before its
+                    # cancellation. Reconcile those fills before sizing the
+                    # stop-loss market order, otherwise the SL can oversell.
+                    tp_fills = []
+                    for order_id, key in tracked_tp_orders.items():
+                        order = self.client.fetch_order(
+                            order_id, f"{symbol}/{self.quote}"
+                        )
+                        if not order:
+                            raise RuntimeError(
+                                f"Cannot confirm final TP fill state for order {order_id}"
+                            )
+                        order_status = str(order.get("status") or "").lower()
+                        if order_status not in (
+                            "closed", "filled", "canceled", "cancelled", "rejected", "expired"
+                        ):
+                            raise RuntimeError(
+                                f"TP order {order_id} is not confirmed terminal ({order_status or 'unknown'})"
+                            )
+                        if order.get("filled") is None:
+                            raise RuntimeError(
+                                f"TP order {order_id} has no confirmed filled quantity"
+                            )
+                        filled_tp = max(0.0, float(order.get("filled") or 0))
+                        if filled_tp <= 0:
+                            continue
+                        tp_fills.append({
+                            "stage": key.replace("_order_id", ""),
+                            "filled_amount": filled_tp,
+                            "fill_price": float(
+                                order.get("average")
+                                or order.get("price")
+                                or price
+                            ),
+                        })
                     free_after_cancel = float(self.client.get_free_amount(symbol) or 0.0)
                 except Exception as exc:
                     actions.append({
@@ -666,6 +800,42 @@ class Rebalancer:
                         "price": price,
                         "sl": sl,
                         "tracked_amount": tracked_amount,
+                    })
+                    continue
+
+                tp_filled_amount = sum(
+                    float(fill["filled_amount"]) for fill in tp_fills
+                )
+                if tp_filled_amount > tracked_amount + max(tracked_amount * 1e-6, 1e-12):
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None),
+                        "symbol": symbol,
+                        "action": "sl_sell_failed",
+                        "error": (
+                            "Confirmed TP fills exceed the locally tracked remaining amount; "
+                            "manual position reconciliation is required."
+                        ),
+                        "manual_reconciliation_required": True,
+                        "price": price,
+                        "sl": sl,
+                        "tracked_amount": tracked_amount,
+                        "tp_fills": tp_fills,
+                        "cancelled_tp_order_ids": list(tracked_tp_orders),
+                        "remaining_amount": 0.0,
+                    })
+                    continue
+                tracked_amount = max(0.0, tracked_amount - tp_filled_amount)
+                if tracked_amount <= max(float(coin.amount or 0) * 1e-9, 1e-12):
+                    actions.append({
+                        "coin_id": getattr(coin, "id", None),
+                        "symbol": symbol,
+                        "action": "tp_full_close",
+                        "stage": "tp_orders_filled_before_sl",
+                        "price": price,
+                        "filled_amount": tp_filled_amount,
+                        "fill_price": price,
+                        "tp_fills": tp_fills,
+                        "cancelled_tp_order_ids": list(tracked_tp_orders),
                     })
                     continue
 
@@ -688,6 +858,10 @@ class Rebalancer:
                             "sl": sl,
                             "tracked_amount": tracked_amount,
                             "free_after_cancel": free_after_cancel,
+                            "remaining_amount": tracked_amount,
+                            "position_status": status,
+                            "tp_fills": tp_fills,
+                            "cancelled_tp_order_ids": list(tracked_tp_orders),
                         })
                         continue
 
@@ -710,6 +884,9 @@ class Rebalancer:
                                 "filled_amount": filled,
                                 "remaining_amount": max(0.0, tracked_amount - filled),
                                 "requested_amount": amount,
+                                "position_status": status,
+                                "tp_fills": tp_fills,
+                                "cancelled_tp_order_ids": list(tracked_tp_orders),
                             })
                             continue
                         sold = True
@@ -724,6 +901,10 @@ class Rebalancer:
                             "tracked_amount": tracked_amount,
                             "free_after_cancel": free_after_cancel,
                             "amount": amount,
+                            "remaining_amount": tracked_amount,
+                            "position_status": status,
+                            "tp_fills": tp_fills,
+                            "cancelled_tp_order_ids": list(tracked_tp_orders),
                         })
                         continue
 
@@ -747,19 +928,20 @@ class Rebalancer:
                     "reentry_available": True,   # دايماً متاح
                     "auto_reentry": True,
                     "repeatable": True,
+                    "position_status": status,
+                    "tp_fills": tp_fills,
+                    "cancelled_tp_order_ids": list(tracked_tp_orders),
                 })
                 continue
 
-            # الوضع اليدوي فقط: إذا لم توجد أوامر Limit، استخدم مراقبة TP كخطة بديلة.
-            # بعد تحقق TP2 لا نرفع الاستوب تلقائياً؛ يبقى وقف المستخدم ثابتاً.
+            # إذا لم يوجد أمر Limit للمرحلة الحالية، راقب TP محلياً كخطة بديلة.
             has_exchange_tp = any(
                 getattr(coin, key, None)
                 for key in ("tp1_order_id", "tp2_order_id", "tp3_order_id")
             )
-            portfolio = getattr(coin, "portfolio", None)
             base_amount = float(coin.amount or remaining or 0)
-            tp1_sell_pct = float(getattr(portfolio, "tp1_sell_pct", None) or 40.0)
-            tp2_sell_pct = float(getattr(portfolio, "tp2_sell_pct", None) or 40.0)
+            tp1_sell_pct = self._tp_sell_pct(coin, "tp1")
+            tp2_sell_pct = self._tp_sell_pct(coin, "tp2")
             tp1_px = float(coin.tp1_price or 0)
             tp2_px = float(coin.tp2_price or 0)
             if not has_exchange_tp:
@@ -768,7 +950,7 @@ class Rebalancer:
                     actions.append({
                         "coin_id": getattr(coin, "id", None), "symbol": symbol,
                         "action": "tp1_hit", "price": price, "fill_price": price,
-                        "filled_amount": filled, "new_sl": sl,
+                        "filled_amount": filled, "new_sl": entry,
                     })
                     continue
                 if status == "tp1_hit" and tp2_px > 0 and price >= tp2_px:
@@ -776,7 +958,8 @@ class Rebalancer:
                     actions.append({
                         "coin_id": getattr(coin, "id", None), "symbol": symbol,
                         "action": "tp2_hit", "price": price, "fill_price": price,
-                        "filled_amount": filled, "new_sl": sl,
+                        "filled_amount": filled,
+                        "new_sl": max(sl, tp1_px if tp1_px > 0 else entry),
                     })
                     continue
 

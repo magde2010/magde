@@ -152,6 +152,40 @@ class MexcClient:
                     prices[s] = 0.0
         return prices
 
+    def get_all_sell_prices(self, symbols: List[str]) -> Dict[str, float]:
+        """Batch best-bid prices for sell-side triggers, falling back to last."""
+        prices: Dict[str, float] = {self.quote: 1.0}
+        if not symbols:
+            return prices
+
+        unique = list(dict.fromkeys(
+            self.normalize_asset_symbol(s) for s in symbols if s
+        ))
+        pairs = [f"{s}/{self.quote}" for s in unique]
+        try:
+            tickers = self.exchange.fetch_tickers(pairs)
+            for symbol, pair in zip(unique, pairs):
+                ticker = tickers.get(pair) or {}
+                value = ticker.get("bid")
+                if value is None:
+                    value = ticker.get("last")
+                if value is None:
+                    value = ticker.get("close")
+                prices[symbol] = float(value) if value is not None else 0.0
+        except Exception:
+            for symbol, pair in zip(unique, pairs):
+                try:
+                    ticker = self.exchange.fetch_ticker(pair) or {}
+                    value = ticker.get("bid")
+                    if value is None:
+                        value = ticker.get("last")
+                    if value is None:
+                        value = ticker.get("close")
+                    prices[symbol] = float(value) if value is not None else 0.0
+                except Exception:
+                    prices[symbol] = 0.0
+        return prices
+
     def get_portfolio_value(self) -> Dict:
         """
         Returns full account value.
