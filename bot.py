@@ -1950,22 +1950,30 @@ async def _do_rebuild_positions(query, tid, pf_id):
             if str(coin.symbol or "").strip().upper() in refreshed_symbols
             and float(coin.remaining_amount or 0) > 0
         ] if refreshed_symbols else []
-        # Final report
+        # Final report: concise user-facing summary, not internal counters.
+        if total_spent > 0 or total_sold_usdt > 0:
+            actions = []
+            if total_spent > 0:
+                actions.append(f"شراء `{total_spent:.2f}$`")
+            if total_sold_usdt > 0:
+                actions.append(f"بيع `{total_sold_usdt:.2f}$`")
+            action_summary = "تم تنفيذ: " + " | ".join(actions)
+        else:
+            action_summary = "لم يتم شراء أو بيع؛ تم تحديث خطة الحماية فقط"
+        value_delta = total_value - target_per_coin * n_coins
+        delta_text = f"أعلى من الهدف بـ `{value_delta:.2f}$`" if value_delta >= 0 else f"أقل من الهدف بـ `{abs(value_delta):.2f}$`"
         lines = [
-            f"✅ *تمت إعادة بناء مراكز* `{p.name}`",
+            f"✅ *تم تحديث محفظة* `{p.name}`",
             "━━━━━━━━━━━━━━━━━━━━",
-            f"💰 التخصيص: `{allocated:.0f}$` ÷ `{n_coins}` = *`{target_per_coin:.2f}$`* لكل عملة",
-            f"📊 كانت القيمة: `{total_value:.2f}$` | الناقص: `{total_need:.2f}$`",
-            f"🗑 أوامر قديمة ملغاة: `{cancelled_count}`",
-            f"🔻 بيع الزائد: `{len(sold_trim)}`" + (f" — {', '.join(f'`{x}`' for x in sold_trim[:8])}" if sold_trim else ""),
-            f"🛒 عملات جديدة: `{len(bought)}`" + (f" — {', '.join(f'`{x}`' for x in bought)}" if bought else ""),
-            f"📈 تم تكميل: `{len(topped)}`" + (f" — {', '.join(f'`{x}`' for x in topped[:8])}" if topped else ""),
-            f"💵 صُرف: `{total_spent:.2f}$` | من البيع: `{total_sold_usdt:.2f}$` | USDT: `{free_after:.2f}$`",
-            f"🎯 أهداف/وقف وُضعت لـ: `{len(refreshed)}` عملة",
-            f"📌 أساس الحساب من الآن: *`{float(p.base_investment or 0):.2f}$`* (آخر إعادة بناء)",
+            "🟢 الحالة: المراكز جاهزة للمراقبة",
+            f"💰 الميزانية المستهدفة: *`{allocated:.2f}$`*",
+            f"📊 القيمة الحالية: *`{total_value:.2f}$`* — {delta_text}",
+            f"💵 رصيد USDT المتاح: *`{free_after:.2f}$`*",
+            f"🔧 النتيجة: {action_summary}",
+            f"🎯 تم تحديث الأهداف والاستوب لـ `{len(refreshed)}` عملة",
         ]
         if rebuilt_coins:
-            lines.extend(["", "📋 *تفاصيل الأهداف والحماية*"])
+            lines.extend(["", "📋 *خطة التداول الحالية*"])
             for coin in rebuilt_coins:
                 entry = float(coin.entry_price or 0)
                 tp1_price = float(coin.tp1_price or 0)
@@ -1973,18 +1981,18 @@ async def _do_rebuild_positions(query, tid, pf_id):
                 sl_price = float(coin.original_sl_price or coin.current_sl_price or 0)
                 current_sl = float(coin.current_sl_price or sl_price or 0)
                 coin_lines = [
-                    f"*{coin.symbol}* — الدخول/المتوسط: `{entry:.8g}`",
+                    f"*{coin.symbol.upper()}* — متوسط الدخول: `{entry:.8g}`",
                 ]
                 if tp1_price > 0:
-                    coin_lines.append(f"• الهدف 1: +`{tp1:.2f}%` عند `{tp1_price:.8g}` — بيع `{s1:.0f}%`")
+                    coin_lines.append(f"🎯 الهدف 1: +`{tp1:.2f}%` عند `{tp1_price:.8g}` — بيع `{s1:.0f}%`")
                 if tp2_price > 0:
-                    coin_lines.append(f"• الهدف 2: +`{tp2:.2f}%` عند `{tp2_price:.8g}` — بيع `{s2:.0f}%`")
+                    coin_lines.append(f"🎯 الهدف 2: +`{tp2:.2f}%` عند `{tp2_price:.8g}` — بيع `{s2:.0f}%`")
                 if tp3 > 0 and float(coin.tp3_price or 0) > 0:
-                    coin_lines.append(f"• الهدف 3: +`{tp3:.2f}%` عند `{float(coin.tp3_price):.8g}`")
-                coin_lines.append(f"• الاستوب الابتدائي: -`{sl_pct:.2f}%` عند `{sl_price:.8g}`")
+                    coin_lines.append(f"🎯 الهدف 3: +`{tp3:.2f}%` عند `{float(coin.tp3_price):.8g}`")
+                coin_lines.append(f"🛡 وقف الخسارة: -`{sl_pct:.2f}%` عند `{sl_price:.8g}`")
                 if abs(current_sl - sl_price) > max(abs(sl_price) * 1e-9, 1e-12):
-                    coin_lines.append(f"• الاستوب الحالي: `{current_sl:.8g}`")
-                coin_lines.append("• بعد الهدف 2: المتبقي محمي باستوب متحرك")
+                    coin_lines.append(f"🛡 الوقف الحالي: `{current_sl:.8g}`")
+                coin_lines.append("🔄 بعد الهدف 2: المتبقي يحميه وقف متحرك")
                 lines.extend(coin_lines)
         all_errs = cancel_errors[:3] + sell_errors + buy_errors + refresh_errors
         if all_errs:
