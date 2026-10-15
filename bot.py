@@ -1938,6 +1938,12 @@ async def _do_rebuild_positions(query, tid, pf_id):
         )
 
         free_after = client.get_free_usdt()
+        refreshed_symbols = {str(symbol).split("(", 1)[0] for symbol in refreshed}
+        rebuilt_coins = db.query(PortfolioCoin).filter(
+            PortfolioCoin.portfolio_id == p.id,
+            PortfolioCoin.symbol.in_(refreshed_symbols),
+            PortfolioCoin.remaining_amount > 0,
+        ).all() if refreshed_symbols else []
         # Final report
         lines = [
             f"✅ *تمت إعادة بناء مراكز* `{p.name}`",
@@ -1952,6 +1958,28 @@ async def _do_rebuild_positions(query, tid, pf_id):
             f"🎯 أهداف/وقف وُضعت لـ: `{len(refreshed)}` عملة",
             f"📌 أساس الحساب من الآن: *`{float(p.base_investment or 0):.2f}$`* (آخر إعادة بناء)",
         ]
+        if rebuilt_coins:
+            lines.extend(["", "📋 *تفاصيل الأهداف والحماية*"])
+            for coin in rebuilt_coins:
+                entry = float(coin.entry_price or 0)
+                tp1_price = float(coin.tp1_price or 0)
+                tp2_price = float(coin.tp2_price or 0)
+                sl_price = float(coin.original_sl_price or coin.current_sl_price or 0)
+                current_sl = float(coin.current_sl_price or sl_price or 0)
+                coin_lines = [
+                    f"*{coin.symbol}* — الدخول/المتوسط: `{entry:.8g}`",
+                ]
+                if tp1_price > 0:
+                    coin_lines.append(f"• الهدف 1: +`{tp1:.2f}%` عند `{tp1_price:.8g}` — بيع `{sell1:.0f}%`")
+                if tp2_price > 0:
+                    coin_lines.append(f"• الهدف 2: +`{tp2:.2f}%` عند `{tp2_price:.8g}` — بيع `{sell2:.0f}%`")
+                if tp3 > 0 and float(coin.tp3_price or 0) > 0:
+                    coin_lines.append(f"• الهدف 3: +`{tp3:.2f}%` عند `{float(coin.tp3_price):.8g}`")
+                coin_lines.append(f"• الاستوب الابتدائي: -`{sl_pct:.2f}%` عند `{sl_price:.8g}`")
+                if abs(current_sl - sl_price) > max(abs(sl_price) * 1e-9, 1e-12):
+                    coin_lines.append(f"• الاستوب الحالي: `{current_sl:.8g}`")
+                coin_lines.append("• بعد الهدف 2: المتبقي محمي باستوب متحرك")
+                lines.extend(coin_lines)
         all_errs = cancel_errors[:3] + sell_errors + buy_errors + refresh_errors
         if all_errs:
             lines.append("\n⚠️ ملاحظات:")
