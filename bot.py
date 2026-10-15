@@ -2151,8 +2151,7 @@ async def _do_rebuild_positions(query, tid, pf_id):
             reply_markup=pf_keyboard(pf_id, True) if len(report_chunks) == 1 else None,
         )
         for index, chunk in enumerate(report_chunks[1:], start=1):
-            await context.bot.send_message(
-                tid,
+            await query.message.reply_text(
                 chunk,
                 parse_mode="Markdown",
                 reply_markup=pf_keyboard(pf_id, True) if index == len(report_chunks) - 1 else None,
