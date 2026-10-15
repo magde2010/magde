@@ -2000,6 +2000,9 @@ async def _do_rebuild_positions(query, tid, pf_id):
         # cash and caused false "USDT available" errors.
         budget_left = max(0.0, allocated - cur_after) + total_sold_usdt
 
+        # Fund the largest shortfall first; otherwise earlier small purchases
+        # can consume the released USDT and leave the newly added coin last.
+        under.sort(key=lambda item: item[4], reverse=True)
         for coin, amt, price, val, need in under:
             # حدّث الرصيد الحر قبل كل شراء
             free_usdt = client.get_free_usdt()
