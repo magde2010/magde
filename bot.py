@@ -1976,9 +1976,9 @@ async def _do_rebuild_positions(query, tid, pf_id):
                     f"*{coin.symbol}* — الدخول/المتوسط: `{entry:.8g}`",
                 ]
                 if tp1_price > 0:
-                    coin_lines.append(f"• الهدف 1: +`{tp1:.2f}%` عند `{tp1_price:.8g}` — بيع `{sell1:.0f}%`")
+                    coin_lines.append(f"• الهدف 1: +`{tp1:.2f}%` عند `{tp1_price:.8g}` — بيع `{s1:.0f}%`")
                 if tp2_price > 0:
-                    coin_lines.append(f"• الهدف 2: +`{tp2:.2f}%` عند `{tp2_price:.8g}` — بيع `{sell2:.0f}%`")
+                    coin_lines.append(f"• الهدف 2: +`{tp2:.2f}%` عند `{tp2_price:.8g}` — بيع `{s2:.0f}%`")
                 if tp3 > 0 and float(coin.tp3_price or 0) > 0:
                     coin_lines.append(f"• الهدف 3: +`{tp3:.2f}%` عند `{float(coin.tp3_price):.8g}`")
                 coin_lines.append(f"• الاستوب الابتدائي: -`{sl_pct:.2f}%` عند `{sl_price:.8g}`")
