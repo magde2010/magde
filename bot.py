@@ -405,11 +405,13 @@ def format_pf(p, current_value: float = None, prices: dict = None, events=None) 
             px = float(prices.get(coin.symbol) or entry or 0)
             value = rem * px
             cpnl = value - (rem * entry) if rem > 0 and entry > 0 else 0.0
-            coin_lines.append(f"🪙 *{coin.symbol}* — {value:.2f} USDT")
-        coin_rows = [
-            "   │   ".join(coin_lines[index:index + 2])
-            for index in range(0, len(coin_lines), 2)
-        ]
+            coin_lines.append(f"🪙 *{coin.symbol}* — {value:.2f}")
+        coin_rows = []
+        for index in range(0, len(coin_lines), 2):
+            row = "   │   ".join(coin_lines[index:index + 2])
+            # Force left-to-right visual order inside Telegram's RTL message:
+            # first coin stays on the left, second coin stays on the right.
+            coin_rows.append(f"\u202a{row}\u202c")
         coins_block = "\n────────────\n".join(coin_rows)
     else:
         coins_block = "—"
