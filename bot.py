@@ -404,15 +404,23 @@ def format_pf(p, current_value: float = None, prices: dict = None, events=None) 
             entry = float(coin.entry_price or 0)
             px = float(prices.get(coin.symbol) or entry or 0)
             value = rem * px
-            cpnl = value - (rem * entry) if rem > 0 and entry > 0 else 0.0
-            coin_lines.append(f"🪙 *{coin.symbol}* — {value:.2f}")
-        coin_rows = []
+            coin_lines.append((coin.symbol.upper(), value))
+        table_lines = [
+            "┌────────────┬────────────┐",
+        ]
         for index in range(0, len(coin_lines), 2):
-            row = "   │   ".join(coin_lines[index:index + 2])
-            # Force left-to-right visual order inside Telegram's RTL message:
-            # first coin stays on the left, second coin stays on the right.
-            coin_rows.append(f"\u202a{row}\u202c")
-        coins_block = "\n────────────\n".join(coin_rows)
+            left_symbol, left_value = coin_lines[index]
+            left = f"{left_symbol:<4}{left_value:>6.2f}"
+            if index + 1 < len(coin_lines):
+                right_symbol, right_value = coin_lines[index + 1]
+                right = f"{right_symbol:<4}{right_value:>6.2f}"
+            else:
+                right = ""
+            table_lines.append(f"│ {left:<10} │ {right:<10} │")
+            if index + 2 < len(coin_lines):
+                table_lines.append("├────────────┼────────────┤")
+        table_lines.append("└────────────┴────────────┘")
+        coins_block = "```\n" + "\n".join(table_lines) + "\n```"
     else:
         coins_block = "—"
 
@@ -443,10 +451,9 @@ def format_pf(p, current_value: float = None, prices: dict = None, events=None) 
         ui.page_title(ui.I["portfolio"], f"{p.name}"),
         f"💰 المخصص: *{allocated:.0f}* USDT   📊 الحالي: *{open_value:.2f}* USDT",
         f"🪙 العملات: *{n_coins}*   🎯 التخصيص لكل عملة: *{per_coin:.2f}* USDT",
-        "────────────",
         "📋 *العملات*",
     ]
-    out.append("────────────")
+    out.append("")
     out.append(coins_block)
     return "\n".join(out)
 def format_portfolio_stats(p, events, prices=None) -> str:
