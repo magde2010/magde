@@ -405,8 +405,8 @@ def format_pf(p, current_value: float = None, prices: dict = None, events=None) 
             px = float(prices.get(coin.symbol) or entry or 0)
             value = rem * px
             cpnl = value - (rem * entry) if rem > 0 and entry > 0 else 0.0
-            coin_lines.append(f"• *{coin.symbol}*: `{value:.2f}` USDT")
-        coins_block = "\n".join(coin_lines)
+            coin_lines.append(f"🪙 *{coin.symbol}*: `{value:.2f}` USDT")
+        coins_block = "\n────────────\n".join(coin_lines)
     else:
         coins_block = "—"
 
@@ -435,13 +435,12 @@ def format_pf(p, current_value: float = None, prices: dict = None, events=None) 
 
     out = [
         ui.page_title(ui.I["portfolio"], f"{p.name}"),
-        f"◦ المخصص: *{allocated:.0f}* USDT",
-        f"◦ العملات: *{n_coins}*  ·  لكل عملة: *{per_coin:.2f}$*",
-        f"◦ القيمة الحالية: *{open_value:.2f}$*",
+        f"💰 المخصص: *{allocated:.0f}* USDT   📊 الحالي: *{open_value:.2f}* USDT",
+        f"🪙 العملات: *{n_coins}*   🎯 التخصيص لكل عملة: *{per_coin:.2f}* USDT",
+        "────────────",
+        "📋 *العملات*",
     ]
-    out.append("")
-    out.append(f"العملات ({len(symbols)})")
-    out.append("_القيمة المتاحة حاليًا لكل عملة بالـUSDT._")
+    out.append("────────────")
     out.append(coins_block)
     return "\n".join(out)
 def format_portfolio_stats(p, events, prices=None) -> str:
