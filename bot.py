@@ -399,7 +399,17 @@ def format_pf(p, current_value: float = None, prices: dict = None, events=None) 
     if symbols:
         target_per_coin = float(p.investment_usdt or 0) / len(symbols)
         coin_lines = []
-        for coin in p.coins:
+        active_statuses = {"open", "tp1_hit", "tp2_hit", "tp3_hit", "tp_hit"}
+        ordered_coins = sorted(
+            p.coins,
+            key=lambda coin: (
+                0 if (
+                    (coin.position_status or "idle") in active_statuses
+                    and float(coin.remaining_amount or coin.amount or 0) > 0
+                ) else 1
+            ),
+        )
+        for coin in ordered_coins:
             rem = float(coin.remaining_amount or coin.amount or 0)
             entry = float(coin.entry_price or 0)
             px = float(prices.get(coin.symbol) or entry or 0)
