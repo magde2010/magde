@@ -4453,7 +4453,8 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         pass
                     continue
-                # buy again with equal share of portfolio investment
+                # Re-enter only with the USDT value that was actually sold at
+                # the stop. Never buy the full equal portfolio allocation here.
                 user = get_or_create_user(db, tid)
                 def _pct(pf_val, user_val, default):
                     if pf_val is not None and float(pf_val) > 0:
@@ -4468,7 +4469,9 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 s2 = _pct(getattr(pf, "tp2_sell_pct", None), getattr(user, "tp2_sell_pct", None), 40.0)
                 sl_pct = _pct(getattr(pf, "stop_loss_pct", None), getattr(user, "stop_loss_pct", None), 3.0)
                 n_coins = max(1, len(pf.coins) if pf else 1)
-                usdt = (pf.investment_usdt if pf else 20) / n_coins
+                usdt = float(act.get("reentry_amount_usdt") or 0.0)
+                if usdt <= 0:
+                    usdt = (pf.investment_usdt if pf else 20) / n_coins
                 if usdt < float(config.PORTFOLIO_MIN_ORDER_USDT):
                     return {
                         "symbol": symbol,
@@ -4549,19 +4552,22 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     db, coin.id,
                     position_status=act.get("position_status") or coin.position_status,
                     remaining_amount=remaining_amount,
+                    reentry_price=float(act.get("reentry_price") or 0),
+                    reentry_touched=False,
+                    reentry_used=False,
                     current_sl_price=float(act.get("sl") or coin.current_sl_price or 0),
                 )
                 clear_cancelled_tp_ids(act.get("cancelled_tp_order_ids"))
                 try:
                     await context.bot.send_message(
                         tid,
-                        f"⚠️ *تنفيذ جزئي للاستوب — {symbol}*\n"
+                        f"🛡 *ضرب الاستوب — تنفيذ جزئي — {symbol}*\n"
                         f"تم بيع: `{filled_amount:.8g}` وحدة\n"
                         f"بسعر تقريبي: `{exit_price:.8g}` USDT\n"
                         f"قيمة البيع: *`{sold_value:.2f}` USDT*\n"
                         f"المتبقي: `{remaining_amount:.8g}` وحدة\n"
-                        "المعنى: المنصة نفذت جزءًا فقط، لذلك لم يتم تصفير المركز. "
-                        "سيحاول المراقب بيع الكمية المتبقية مرة أخرى.",
+                        f"إعادة الدخول ستكون بقيمة البيع فقط: *`{sold_value:.2f}` USDT*\n"
+                        "المتبقي محفوظ ولن يُباع مرة أخرى بسبب هذا الاستوب.",
                         parse_mode="Markdown",
                     )
                 except Exception:
@@ -4614,6 +4620,8 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     f"بسعر السوق ≈ `{exit_price:.8g}` USDT\n"
                     f"قيمة البيع: *`{sold_value:.2f}` USDT*\n"
                     f"النتيجة: `{pnl:+.2f}` USDT\n"
+                    f"إعادة الدخول بنفس قيمة البيع: *`{sold_value:.2f}` USDT*\n"
+                    "سماح التنفيذ حول السعر: 1%\n"
                     f"{extra}\n"
                     f"المحفظة: *{pf.name if pf else '—'}*"
                 )

@@ -24,6 +24,8 @@ def log_trade(event: str, symbol: str = "", **kwargs):
 INITIAL_SL_PCT = 3.0
 # إعادة الدخول الاختيارية: السعر يرجع فوق الاستوب المضروب بهذا القدر
 REENTRY_RECOVER_PCT = 1.5
+# سماح تنفيذ إعادة الدخول حول السعر المحفز حتى لا تضيع الإشارة بسبب الحركة السريعة.
+REENTRY_EXEC_TOLERANCE_PCT = 1.0
 # تبريد خفيف بالثواني بين محاولات إعادة الدخول لنفس العملة (منع سبام أوامر)
 REENTRY_COOLDOWN_SEC = 90
 # حد أدنى لقيمة المركز عشان نعتبره مفتوح (dust)
@@ -666,7 +668,7 @@ class Rebalancer:
                         # مهم: متكررة — البوت لازم يصفّر reentry_used بعد النجاح
                         "repeatable": True,
                     })
-                elif price >= reentry_px * 0.995 and not getattr(coin, "reentry_touched", False):
+                elif price >= reentry_px * (1.0 - REENTRY_EXEC_TOLERANCE_PCT / 100.0) and not getattr(coin, "reentry_touched", False):
                     actions.append({
                         "coin_id": getattr(coin, "id", None),
                         "symbol": symbol,
@@ -868,7 +870,9 @@ class Rebalancer:
                                 "filled_amount": filled,
                                 "remaining_amount": max(0.0, tracked_amount - filled),
                                 "requested_amount": amount,
-                                "position_status": status,
+                                "position_status": "waiting_reentry",
+                                "reentry_price": reentry_trigger_price(price, REENTRY_RECOVER_PCT),
+                                "reentry_amount_usdt": max(0.0, filled * price),
                                 "tp_fills": tp_fills,
                                 "cancelled_tp_order_ids": list(tracked_tp_orders),
                             })
@@ -909,6 +913,7 @@ class Rebalancer:
                     "dust": dust,
                     "was_raised": sl >= entry * 0.999 if entry > 0 else False,
                     "reentry_price": trigger,
+                    "reentry_amount_usdt": max(0.0, amount * price),
                     "reentry_available": True,   # دايماً متاح
                     "auto_reentry": True,
                     "repeatable": True,
