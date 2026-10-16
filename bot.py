@@ -406,6 +406,11 @@ def format_pf(p, current_value: float = None, prices: dict = None, events=None) 
                 0 if (
                     (coin.position_status or "idle") in active_statuses
                     and float(coin.remaining_amount or coin.amount or 0) > 0
+                    and float(getattr(coin, "reentry_price", 0) or 0) <= 0
+                    and (
+                        float(coin.remaining_amount or coin.amount or 0)
+                        * float(prices.get(coin.symbol) or coin.entry_price or 0)
+                    ) >= 1.0
                 ) else 1
             ),
         )
