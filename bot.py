@@ -405,10 +405,7 @@ def format_pf(p, current_value: float = None, prices: dict = None, events=None) 
             px = float(prices.get(coin.symbol) or entry or 0)
             value = rem * px
             cpnl = value - (rem * entry) if rem > 0 and entry > 0 else 0.0
-            icon = "🟢" if cpnl >= 0 else "🔴"
-            coin_lines.append(
-                f"{icon} *{coin.symbol}*: `{value:.2f}` / `{target_per_coin:.2f}` USDT  `{cpnl:+.2f}`"
-            )
+            coin_lines.append(f"• *{coin.symbol}*: `{value:.2f}` USDT")
         coins_block = "\n".join(coin_lines)
     else:
         coins_block = "—"
@@ -437,23 +434,14 @@ def format_pf(p, current_value: float = None, prices: dict = None, events=None) 
         health = "🟢 مستقر"
 
     out = [
-        ui.page_title(ui.I["portfolio"], f"{p.name}", health),
-        f"◦ التحكم: *{mode}*",
+        ui.page_title(ui.I["portfolio"], f"{p.name}"),
         f"◦ المخصص: *{allocated:.0f}* USDT",
         f"◦ العملات: *{n_coins}*  ·  لكل عملة: *{per_coin:.2f}$*",
-        f"◦ بداية الدورة: *{baseline:.2f}$*",
         f"◦ القيمة الحالية: *{open_value:.2f}$*",
-        f"{t_emoji} *النتيجة: {total_pnl:+.2f}$  ({total_pct:+.2f}%)*",
-        f"◦ الحالة: *{health}*",
     ]
-    if abs(realized) > 0.0001:
-        r_emoji = "🟢" if realized >= 0 else "🔴"
-        out.append(f"{r_emoji} محقق منذ إعادة البناء: *{realized:+.2f}* $")
-    r24 = "🟢" if realized_24h >= 0 else "🔴"
-    out.append(f"{r24} محقق آخر 24 ساعة: *{realized_24h:+.2f}* $")
     out.append("")
     out.append(f"العملات ({len(symbols)})")
-    out.append("_لكل عملة: القيمة الحالية / المخصص المستهدف / الربح والخسارة._")
+    out.append("_القيمة المتاحة حاليًا لكل عملة بالـUSDT._")
     out.append(coins_block)
     return "\n".join(out)
 def format_portfolio_stats(p, events, prices=None) -> str:
