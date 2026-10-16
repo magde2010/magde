@@ -299,17 +299,24 @@ class MexcClient:
             return order
         except Exception as e:
             err = str(e).lower()
-            # Treat precision / min-amount errors as dust instead of hard failure
-            if any(x in err for x in (
+            # Only narrowly identified exchange minimum/precision rejections count
+            # as dust. Generic filter/network errors must remain visible because
+            # the exchange may have accepted an order before the response failed.
+            dust_markers = (
                 "minimum amount precision",
                 "min amount",
-                "amount of",
-                "filter failure",
-                "notional",
-                "too small",
-            )):
+                "minimum amount",
+                "min notional",
+                "minimum notional",
+                "notional too small",
+                "amount precision",
+                "precision of amount",
+                "amount must be greater than zero",
+                "amount is below the minimum",
+            )
+            if any(marker in err for marker in dust_markers):
                 return None
-            raise Exception(f"Order failed: {str(e)}")
+            raise Exception(f"Order failed (submission state may be unknown): {str(e)}")
 
     # Markers meaning "this exchange/pair rejects the `cost` parameter".
     # Any other failure (timeout, network, 5xx) is genuinely unknown: the order
@@ -457,12 +464,18 @@ class MexcClient:
             if str(order.get("side") or "").lower() == "sell"
         ]
 
-    def fetch_order(self, order_id: str, symbol: str) -> Optional[dict]:
-        """Fetch a single order status."""
+    def fetch_order(self, order_id: str, symbol: str, strict: bool = False) -> Optional[dict]:
+        """Fetch a single order status.
+
+        With strict=True, propagate API/network errors instead of conflating them
+        with a missing order. Safety-critical sell reconciliation must use strict mode.
+        """
         pair = f"{symbol}/{self.quote}" if "/" not in symbol else symbol
         try:
             return self.exchange.fetch_order(order_id, pair)
         except Exception:
+            if strict:
+                raise
             return None
 
     def get_free_amount(self, symbol: str) -> float:

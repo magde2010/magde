@@ -38,7 +38,7 @@ class FakeClient:
         price = self.sell_price if self.sell_price is not None else self.price
         return {symbol: price for symbol in symbols}
 
-    def fetch_order(self, order_id, symbol):
+    def fetch_order(self, order_id, symbol, strict=False):
         return self.order
 
     def create_market_order(self, symbol, side, amount):
@@ -161,6 +161,33 @@ class PortfolioTakeProfitStopLossTests(unittest.TestCase):
         self.assertEqual(actions[0]["action"], "tp1_hit")
         self.assertEqual(actions[0]["filled_amount"], 0.35)
 
+    def test_manual_tp_closed_order_without_filled_amount_is_ignored(self):
+        client = FakeClient()
+        client.order = {
+            "id": "limit-tp1",
+            "status": "closed",
+            "filled": None,
+            "average": 110.0,
+        }
+        reb = Rebalancer(client)
+        coin = position(tp1_order_id="limit-tp1")
+
+        actions = reb.sync_manual_tp_orders([coin])
+
+        self.assertEqual(actions, [])
+
+    def test_nonzero_dust_balance_is_not_auto_closed(self):
+        client = FakeClient()
+        client.price = 100.0
+        client.get_total_amount = lambda symbol: 0.0001
+        client.get_free_amount = lambda symbol: 0.0001
+        reb = Rebalancer(client)
+
+        actions = reb.check_and_manage_positions([position()])
+
+        self.assertEqual(actions, [])
+        self.assertEqual(client.market_orders, [])
+
     def test_cancelled_manual_tp_partial_fill_is_not_lost(self):
         client = FakeClient()
         client.order = {
@@ -205,7 +232,7 @@ class PortfolioTakeProfitStopLossTests(unittest.TestCase):
         self.assertEqual(actions[0]["tp_fills"][0]["filled_amount"], 0.3)
         self.assertEqual(client.market_orders[0][2], 0.7)
 
-    def test_stop_loss_cancels_legacy_untracked_sell_orders(self):
+    def test_stop_loss_refuses_to_cancel_untracked_sell_orders(self):
         client = FakeClient()
         client.price = 89.0
         client.order_to_create = {
@@ -215,16 +242,25 @@ class PortfolioTakeProfitStopLossTests(unittest.TestCase):
             "average": 89.0,
         }
         client.free_amounts = [1.0]
-        stale = [{"id": "legacy-1", "side": "sell"}, {"id": "legacy-2", "side": "sell"}]
-        client.fetch_open_sell_orders = lambda symbol: (
-            stale if len(client.cancelled) < len(stale) else []
-        )
+        stale = [{"id": "manual-1", "side": "sell"}]
+        client.fetch_open_sell_orders = lambda symbol: stale
         reb = Rebalancer(client)
         with patch("rebalancer.time.sleep", return_value=None):
             actions = reb.check_and_manage_positions([position()])
-        self.assertEqual(actions[0]["action"], "sl_hit_sold")
-        self.assertIn(("legacy-1", "ABC/USDT"), client.cancelled)
-        self.assertIn(("legacy-2", "ABC/USDT"), client.cancelled)
+        self.assertEqual(actions[0]["action"], "sl_sell_failed")
+        self.assertEqual(client.cancelled, [])
+        self.assertEqual(client.market_orders, [])
+        self.assertIn("Untracked open sell order", actions[0]["error"])
+
+    def test_stop_portfolio_refuses_to_liquidate_wallet_without_allocation(self):
+        client = FakeClient()
+        reb = Rebalancer(client)
+
+        result = reb.stop_portfolio(["ABC"])
+
+        self.assertEqual(client.market_orders, [])
+        self.assertEqual(result["executed"], [])
+        self.assertTrue(result["errors"])
 
     def test_stop_trails_up_after_tp2_and_never_sets_above_market(self):
         client = FakeClient()

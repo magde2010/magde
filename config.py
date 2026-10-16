@@ -14,9 +14,11 @@ if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-# رقم الأدمن فقط يقدر يستخدم البوت (مستحسن جداً)
+# Fail closed: missing/invalid admin ID must never grant public access.
 try:
-    ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0") or "0")
+    ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "") or "")
+    if ADMIN_TELEGRAM_ID <= 0:
+        ADMIN_TELEGRAM_ID = 0
 except (TypeError, ValueError):
     ADMIN_TELEGRAM_ID = 0
 

@@ -83,7 +83,7 @@ class Rebalancer:
             if not order_id or not hasattr(self.client, "fetch_order"):
                 break
             time.sleep(0.4)
-            checked = self.client.fetch_order(order_id, symbol) or checked
+            checked = self.client.fetch_order(order_id, symbol, strict=True) or checked
         try:
             filled = float(checked.get("filled") or 0)
         except (TypeError, ValueError):
@@ -215,7 +215,11 @@ class Rebalancer:
         dry_run: bool = False,
         amount_overrides: Optional[Dict[str, float]] = None,
     ) -> Dict:
-        """Sell all holdings of the given coins."""
+        """Sell only explicitly allocated quantities after checking open orders.
+
+        A missing amount override is deliberately not interpreted as permission to
+        liquidate the exchange wallet's entire free balance.
+        """
         results = {
             "action": "stop",
             "executed": [],
@@ -223,43 +227,70 @@ class Rebalancer:
             "dry_run": dry_run,
             "total_sold_usdt": 0.0,
         }
-        balances = self.client.get_balance()
         prices = self.client.get_all_prices(coins)
         for coin in coins:
             override = (amount_overrides or {}).get(coin)
             if override is None:
-                amount = float(balances.get(coin, 0.0))
-            else:
-                amount = min(float(override or 0.0), float(balances.get(coin, 0.0)))
-            if amount <= 0:
+                results["errors"].append({
+                    coin: "رفض البيع دون كمية مخصصة صراحةً للمركز (amount_overrides)."
+                })
                 continue
-            amount = amount * 0.999
-            usdt_value = amount * prices.get(coin, 0.0)
             try:
+                free_amount = max(0.0, float(self.client.get_free_amount(coin) or 0))
+                amount = min(max(0.0, float(override or 0.0)), free_amount)
+                if amount <= 0:
+                    results["errors"].append({coin: "لا توجد كمية حرة ضمن الكمية المخصصة للمركز."})
+                    continue
+                open_sells = self.client.fetch_open_sell_orders(coin)
+                if open_sells:
+                    ids = ", ".join(str(o.get("id") or "?") for o in open_sells[:5])
+                    results["errors"].append({coin: f"توجد أوامر بيع مفتوحة؛ لم يُرسل أمر جديد: {ids}"})
+                    continue
+                price = float(prices.get(coin) or 0)
                 if dry_run:
                     results["executed"].append({
-                        "symbol": f"{coin}/{self.quote}",
-                        "side": "sell",
-                        "amount": amount,
-                        "usdt": usdt_value,
-                        "status": "dry_run",
+                        "symbol": f"{coin}/{self.quote}", "side": "sell",
+                        "amount": amount, "usdt": amount * price, "status": "dry_run",
                     })
-                    results["total_sold_usdt"] += usdt_value
-                else:
-                    order = self.client.create_market_order(
-                        symbol=f"{coin}/{self.quote}", side="sell", amount=amount
-                    )
-                    results["executed"].append({
-                        "symbol": f"{coin}/{self.quote}",
-                        "side": "sell",
-                        "amount": amount,
-                        "usdt": usdt_value,
-                        "status": "filled",
-                        "order_id": order.get("id") if order else None,
-                    })
-                    results["total_sold_usdt"] += usdt_value
-            except Exception as e:
-                results["errors"].append({coin: str(e)})
+                    results["total_sold_usdt"] += amount * price
+                    continue
+                order = self.client.create_market_order(
+                    symbol=f"{coin}/{self.quote}", side="sell", amount=amount
+                )
+                if not order or not order.get("id"):
+                    raise RuntimeError("لم يتم تأكيد معرّف أمر البيع؛ النتيجة غير محسومة.")
+                order_id = str(order["id"])
+                checked = order
+                terminal_statuses = {"closed", "filled", "canceled", "cancelled", "expired", "rejected"}
+                for _ in range(5):
+                    status = str(checked.get("status") or "").lower()
+                    if status in terminal_statuses:
+                        break
+                    checked = self.client.fetch_order(order_id, f"{coin}/{self.quote}", strict=True)
+                    if not checked:
+                        raise RuntimeError(f"تعذر تأكيد حالة أمر البيع {order_id}؛ لا تعِد الإرسال.")
+                    time.sleep(0.4)
+                status = str(checked.get("status") or "").lower()
+                if status not in terminal_statuses:
+                    raise RuntimeError(f"حالة أمر البيع {order_id} غير محسومة ({status or 'unknown'}). لا تعِد الإرسال.")
+                filled = max(0.0, float(checked.get("filled") or 0))
+                if filled <= 0:
+                    raise RuntimeError(f"لم تؤكد المنصة تنفيذ أمر البيع {order_id}.")
+                filled = min(filled, amount)
+                cost = float(checked.get("cost") or 0)
+                avg = float(checked.get("average") or checked.get("price") or 0)
+                sold_usdt = cost if cost > 0 else filled * avg
+                if sold_usdt <= 0:
+                    raise RuntimeError(f"تم تأكيد كمية الأمر {order_id} دون قيمة بيع قابلة للتأكيد.")
+                results["executed"].append({
+                    "symbol": f"{coin}/{self.quote}", "side": "sell",
+                    "amount": filled, "requested_amount": amount,
+                    "usdt": sold_usdt, "status": status, "order_id": order_id,
+                    "partial": filled + max(1e-10, amount * 1e-6) < amount,
+                })
+                results["total_sold_usdt"] += sold_usdt
+            except Exception as exc:
+                results["errors"].append({coin: str(exc)})
         return results
 
     def cancel_tp_orders(self, coins_data: List[Dict[str, Any]]) -> Dict:
@@ -377,7 +408,7 @@ class Rebalancer:
             if not order_id:
                 continue
             try:
-                order = self.client.fetch_order(order_id, coin.symbol)
+                order = self.client.fetch_order(order_id, coin.symbol, strict=True)
             except Exception as exc:
                 # A temporary status-read failure must not stop the separate
                 # price/SL monitor for every position.
@@ -415,9 +446,14 @@ class Rebalancer:
                 continue
             remaining = float(coin.remaining_amount or coin.amount or 0)
             original = float(coin.amount or remaining or 0)
-            filled = float((order or {}).get("filled") or 0)
+            filled_raw = (order or {}).get("filled")
+            filled = float(filled_raw) if filled_raw is not None else 0.0
             if filled <= 0:
-                filled = min(remaining, original * fallback_pct / 100.0)
+                logger.warning(
+                    "Ignoring closed TP order with no confirmed filled quantity: %s %s",
+                    coin.symbol, order_id,
+                )
+                continue
             price = float((order or {}).get("average") or (order or {}).get("price") or fallback_price or 0)
             entry = float(coin.entry_price or 0)
             tp1_px = float(coin.tp1_price or 0)
@@ -549,16 +585,17 @@ class Rebalancer:
                 continue
             market_val = effective_amt * price
             if status != "waiting_reentry":
-                if effective_amt <= 0 or market_val < MIN_POSITION_USDT:
+                if effective_amt <= 0:
                     streak = self._balance_zero_streak.get(symbol, 0) + 1
                     self._balance_zero_streak[symbol] = streak
                     if streak < 3:
                         logger.warning(
-                            "Preserving %s: confirmed low balance read %s/3 (amount=%.8g, value=%.6g)",
-                            symbol, streak, effective_amt, market_val,
+                            "Preserving %s: confirmed zero balance read %s/3",
+                            symbol, streak,
                         )
                         continue
-                    # لو القاعدة أصلًا فاضية → صامت (تزامن بدون إشعار)
+                    # A confirmed zero balance can be reconciled, but is not itself
+                    # evidence of a fill price/quantity. The bot checks shared allocations.
                     silent = remaining <= 0
                     actions.append({
                         "coin_id": getattr(coin, "id", None),
@@ -566,10 +603,18 @@ class Rebalancer:
                         "action": "tp_full_close",
                         "stage": "balance_zero",
                         "price": price,
-                        "filled_amount": remaining if remaining > 0 else 0,
-                        "fill_price": price,
+                        "filled_amount": 0.0,
+                        "fill_price": 0.0,
                         "silent": silent,
                     })
+                    continue
+                if market_val < MIN_POSITION_USDT:
+                    # Dust is still an asset. Keep its record for explicit/manual reconciliation.
+                    logger.warning(
+                        "Preserving %s: non-zero dust balance amount=%.8g value=%.6g",
+                        symbol, effective_amt, market_val,
+                    )
+                    self._balance_zero_streak.pop(symbol, None)
                     continue
                 self._balance_zero_streak.pop(symbol, None)
 
@@ -669,28 +714,30 @@ class Rebalancer:
                             if str(order.get("id") or "") not in tracked_tp_orders
                         ]
                         if unknown:
-                            for order in unknown:
-                                order_id = str(order.get("id") or "")
-                                if not order_id:
-                                    continue
-                                logger.warning(
-                                    "Cancelling stale untracked portfolio sell before SL: %s %s",
-                                    symbol,
-                                    order_id,
-                                )
-                                self.client.cancel_order(
-                                    order_id, f"{symbol}/{self.quote}", strict=False
-                                )
+                            ids = ", ".join(str(o.get("id") or "?") for o in unknown[:5])
+                            raise RuntimeError(
+                                "Untracked open sell order(s) exist for this symbol; "
+                                f"refusing to cancel or sell against orders not owned by this position: {ids}"
+                            )
                         if attempt < 3:
                             for order in remaining_sells:
-                                self.client.cancel_order(
-                                    str(order.get("id")), f"{symbol}/{self.quote}", strict=False
-                                )
+                                order_id = str(order.get("id") or "")
+                                if order_id and order_id in tracked_tp_orders:
+                                    self.client.cancel_order(
+                                        order_id, f"{symbol}/{self.quote}", strict=False
+                                    )
                     if remaining_sells:
                         ids = [str(order.get("id") or "?") for order in remaining_sells[:5]]
                         raise RuntimeError(
                             f"Open tracked sell orders remain after repeated TP cancellation: {', '.join(ids)}"
                         )
+
+                    # Recheck once more immediately before reconciliation/sizing.
+                    # Never submit a market sell while an unrelated sell may still fill.
+                    final_open_sells = self.client.fetch_open_sell_orders(symbol)
+                    if final_open_sells:
+                        ids = ", ".join(str(o.get("id") or "?") for o in final_open_sells[:5])
+                        raise RuntimeError(f"Open sell order remains; refusing stop-loss market sell: {ids}")
 
                     # A limit TP may have partially filled just before its
                     # cancellation. Reconcile those fills before sizing the
@@ -698,7 +745,7 @@ class Rebalancer:
                     tp_fills = []
                     for order_id, key in tracked_tp_orders.items():
                         order = self.client.fetch_order(
-                            order_id, f"{symbol}/{self.quote}"
+                            order_id, f"{symbol}/{self.quote}", strict=True
                         )
                         if not order:
                             raise RuntimeError(

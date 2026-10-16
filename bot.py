@@ -274,9 +274,9 @@ def get_reb() -> Rebalancer:
 
 
 def is_admin(user_id: int) -> bool:
-    if not config.ADMIN_TELEGRAM_ID:
-        return True
-    return user_id == config.ADMIN_TELEGRAM_ID
+    # Fail closed: an absent or invalid configured admin never opens the bot.
+    admin_id = int(getattr(config, "ADMIN_TELEGRAM_ID", 0) or 0)
+    return admin_id > 0 and user_id == admin_id
 
 
 async def ensure_admin(update: Update) -> bool:
@@ -294,7 +294,6 @@ def main_menu_keyboard():
     return ui.markup([
         ui.row((f"{ui.I['portfolio']}  المحافظ", "list_pf"), (f"{ui.I['new']}  محفظة جديدة", "create_pf")),
         ui.row((f"{ui.I['balance']}  الرصيد", "balance"), (f"{ui.I['settings']}  الإعدادات", "settings")),
-        [ui.button("▦  نظام Grid", "grid_menu")],
         [ui.button(f"{ui.I['cleanup']}  تنظيف البيانات", "cleanup_db")],
     ])
 
@@ -784,16 +783,6 @@ async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     tid = update.effective_user.id
 
-    grid_field = context.user_data.pop("grid_setting", None)
-    if grid_field:
-        from grid_integration import update_grid_setting
-        ok, message = update_grid_setting(grid_field, text)
-        await update.message.reply_text(
-            ("✅ " if ok else "⚠️ ") + message,
-            reply_markup=main_menu_keyboard() if ok else None,
-        )
-        return
-
     if context.user_data.get("waiting"):
         # تعديل إعدادات المحافظ العامة
         user_field = context.user_data.get("edit_user_tpsl")
@@ -876,236 +865,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     data = query.data or ""
     tid = update.effective_user.id
-    if data == "grid_settings":
-        from grid_integration import get_grid_service
-        service, error = get_grid_service()
-        if error:
-            await query.edit_message_text(f"⚠️ {error}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ رجوع", callback_data="grid_menu")]]))
-            return
-        c = service.cfg
-        await query.edit_message_text(
-            "⚙️ *إعدادات Grid*\n\n"
-            f"العملة: `{c.symbol}`\nالميزانية: `{c.total_budget}` USDT\nالدخول الأولي: `{c.initial_pct}%`\n"
-            f"الوضع: `{'DRY RUN' if c.dry_run else 'LIVE'}`\n"
-            f"DCA هبوط: `{','.join(map(str, c.dca_drops))}%`\n"
-            f"DCA توزيع: `{','.join(map(str, c.dca_allocations))}%`\n"
-            f"TP أهداف: `{','.join(map(str, c.tp_gains))}%`\n"
-            f"TP بيع: `{','.join(map(str, c.tp_sell_pcts))}%`\n"
-            f"إعادة التمركز: `{c.upward_recenter_percent}%`\n\n"
-            "أوقف Grid قبل تعديل أي إعداد.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("العملة", callback_data="grid_set_symbol"), InlineKeyboardButton("الميزانية", callback_data="grid_set_budget")],
-                [InlineKeyboardButton("الدخول الأولي %", callback_data="grid_set_initial"), InlineKeyboardButton("إعادة التمركز %", callback_data="grid_set_recenter")],
-                [InlineKeyboardButton("هبوط DCA الأربعة", callback_data="grid_set_dca_drops")],
-                [InlineKeyboardButton("توزيع DCA الأربعة", callback_data="grid_set_dca_allocations")],
-                [InlineKeyboardButton("أهداف TP الأربعة", callback_data="grid_set_tp_gains")],
-                [InlineKeyboardButton("نسب بيع TP الأربعة", callback_data="grid_set_tp_sell_pcts")],
-                [InlineKeyboardButton("🔴 طلب التحويل إلى LIVE", callback_data="grid_live_request"), InlineKeyboardButton("🟡 العودة إلى Dry Run", callback_data="grid_dry_run")],
-                [InlineKeyboardButton("↩ رجوع إلى Grid", callback_data="grid_menu")],
-            ]),
-        )
-        return
-    if data == "grid_live_request":
-        from grid_integration import get_grid_service
-        service, error = get_grid_service()
-        if error:
-            await query.edit_message_text(f"⚠️ {error}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ رجوع", callback_data="grid_settings")]]))
-            return
-        await query.edit_message_text(
-            "⚠️ *تأكيد التداول الحقيقي*\n\n"
-            f"العملة: `{service.cfg.symbol}`\n"
-            f"إجمالي الميزانية: `{service.cfg.total_budget}` USDT\n"
-            f"الدخول الأولي: `{service.cfg.initial_pct}%`\n"
-            "بعد التأكيد سيتصل النظام بحساب MEXC ويرسل أوامر فعلية عند تشغيل Grid.\n"
-            "تأكد أن مفتاح MEXC للسوق الفوري فقط وبدون صلاحية سحب.\n\n"
-            "التأكيد لا يبدأ التداول تلقائيًا؛ سيبقى Grid متوقفًا.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ أؤكد التحويل إلى LIVE", callback_data="grid_live_confirm")],
-                [InlineKeyboardButton("إلغاء", callback_data="grid_settings")],
-            ]),
-        )
-        return
-    if data in {"grid_live_confirm", "grid_dry_run"}:
-        from grid_integration import switch_grid_mode
-        ok, message = switch_grid_mode(data == "grid_live_confirm")
-        await query.edit_message_text(
-            ("✅ " if ok else "⚠️ ") + message,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ إعدادات Grid", callback_data="grid_settings"), InlineKeyboardButton("↩ Grid", callback_data="grid_menu")]]),
-        )
-        return
-    if data.startswith("grid_set_"):
-        field = data[len("grid_set_"):]
-        prompts = {
-            "symbol": "أرسل رمز العملة، مثال: BTC/USDT أو ETH/USDT",
-            "budget": "أرسل إجمالي الميزانية بالدولار، مثال: 100",
-            "initial": "أرسل نسبة الدخول الأولي، مثال: 50 (والباقي يذهب إلى DCA)",
-            "recenter": "أرسل نسبة الصعود التي عندها يعاد تمركز الشبكة، مثال: 10",
-            "dca_drops": "أرسل 4 نسب هبوط مفصولة بفواصل، مثال: 2.5,5,7.5,10",
-            "dca_allocations": "أرسل 4 نسب توزيع DCA ومجموعها يجب أن يكون 100، مثال: 20,24,26,30",
-            "tp_gains": "أرسل 4 أهداف ربح مفصولة بفواصل، مثال: 2,4,7,10",
-            "tp_sell_pcts": "أرسل 4 نسب بيع ومجموعها يجب أن يكون 100، مثال: 25,25,25,25 أو 100,0,0,0",
-        }
-        if field not in prompts:
-            return
-        context.user_data["grid_setting"] = field
-        await query.edit_message_text(f"⚙️ {prompts[field]}\n\nاكتب /cancel للإلغاء.")
-        return
-    if data == "grid_menu":
-        from grid_integration import get_grid_service
-        service, error = get_grid_service()
-        if error:
-            await query.edit_message_text(
-                f"⚠️ {error}\n\nتأكد من إعدادات GRID_* ثم أعد تشغيل البوت.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ القائمة", callback_data="menu")]]),
-            )
-            return
-        p = service.db.position()
-        state = p.get("state") or "IDLE"
-        mode = "DRY RUN" if service.cfg.dry_run else "LIVE"
-        setup_note = "\n⚠️ أكمل اختيار العملة والميزانية من الإعدادات قبل التشغيل." if getattr(service, "needs_setup", False) else ""
-        text = (
-            "▦ *نظام Grid المستقل*\n\n"
-            f"العملة: `{service.cfg.symbol}`\n"
-            f"الوضع: `{mode}`\n"
-            f"الحالة: `{state}`\n"
-            f"الميزانية: `{service.cfg.total_budget}` USDT\n"
-            f"المنصرف: `{p.get('spent', '0')}` USDT\n"
-            f"المتبقي: `{p.get('remaining_budget', '0')}` USDT\n"
-            f"المتوسط: `{p.get('average_entry', '0')}`\n\n"
-            "النظام يبدأ متوقفًا. شغّله بعد مراجعة الإعدادات." + setup_note
-        )
-        await query.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("▶️ تشغيل Grid", callback_data="grid_run"), InlineKeyboardButton("⏸ إيقاف", callback_data="grid_stop")],
-                [InlineKeyboardButton("🛑 إيقاف طوارئ", callback_data="grid_emergency")],
-                [InlineKeyboardButton("📊 متابعة المستويات", callback_data="grid_levels")],
-                [InlineKeyboardButton("♻️ إلغاء الأوامر وبناء الجديد", callback_data="grid_replace_confirm")],
-                [InlineKeyboardButton("🔁 إعادة تشغيل عامة", callback_data="grid_restart_confirm")],
-                [InlineKeyboardButton("⚙️ إعدادات Grid", callback_data="grid_settings")],
-                [InlineKeyboardButton("🔄 تحديث", callback_data="grid_menu"), InlineKeyboardButton("↩ القائمة", callback_data="menu")],
-            ]),
-        )
-        return
-    if data == "grid_levels":
-        from grid_integration import get_grid_service
-        service, error = get_grid_service()
-        if error:
-            await query.edit_message_text(f"⚠️ {error}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Grid", callback_data="grid_menu")]]))
-            return
-        await query.edit_message_text(
-            "📊 *متابعة Grid التفصيلية*\n\n" + service.status_text(),
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 تحديث", callback_data="grid_levels")],
-                [InlineKeyboardButton("⚙️ الإعدادات", callback_data="grid_settings"), InlineKeyboardButton("↩ Grid", callback_data="grid_menu")],
-            ]),
-        )
-        return
-    if data == "grid_replace_confirm":
-        from grid_integration import get_grid_service
-        service, error = get_grid_service()
-        if error:
-            await query.edit_message_text(f"⚠️ {error}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Grid", callback_data="grid_menu")]]))
-            return
-        await query.edit_message_text(
-            "⚠️ *إعادة بناء أوامر Grid*\n\n"
-            f"العملة المتأثرة فقط: `{service.cfg.symbol}`\n"
-            "سيتم إلغاء أوامر Grid المفتوحة لهذه العملة، ثم بناء DCA وTP الجديدين حسب الإعدادات والميزانية.\n"
-            "لن يتم بيع المركز ولن يتم لمس نظام المحافظ.\n\nهل تريد التنفيذ؟",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ نفذ الآن", callback_data="grid_replace_execute")],
-                [InlineKeyboardButton("إلغاء", callback_data="grid_menu")],
-            ]),
-        )
-        return
-    if data == "grid_replace_execute":
-        from grid_integration import replace_grid_orders
-        ok, message = replace_grid_orders()
-        await query.edit_message_text(
-            ("✅ " if ok else "⚠️ ") + message,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 متابعة المستويات", callback_data="grid_levels"), InlineKeyboardButton("↩ Grid", callback_data="grid_menu")]]),
-        )
-        return
-    if data == "grid_restart_confirm":
-        from grid_integration import get_grid_service
-        service, error = get_grid_service()
-        if error:
-            await query.edit_message_text(f"⚠️ {error}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ Grid", callback_data="grid_menu")]]))
-            return
-        await query.edit_message_text(
-            "⚠️ *إعادة تشغيل عامة لـ Grid*\n\n"
-            f"العملة: `{service.cfg.symbol}` — الميزانية: `{service.cfg.total_budget}` USDT\n"
-            "سيتم نسيان سجل Grid القديم، مزامنة كمية العملة الموجودة، ثم إكمال الدخول الأولي إلى النسبة المحددة (50% مثلًا) وترك الباقي لـ DCA وTP بنفس الإعدادات.\n"
-            "لن يتم بيع المركز ولن يتم لمس نظام المحافظ.\n\nهل تريد التنفيذ؟",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ أعد التشغيل الآن", callback_data="grid_restart_execute")],
-                [InlineKeyboardButton("إلغاء", callback_data="grid_menu")],
-            ]),
-        )
-        return
-    if data == "grid_restart_execute":
-        from grid_integration import restart_grid_strategy
-        ok, message = restart_grid_strategy()
-        await query.edit_message_text(
-            ("✅ " if ok else "⚠️ ") + message,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 متابعة المستويات", callback_data="grid_levels"), InlineKeyboardButton("↩ Grid", callback_data="grid_menu")]]),
-        )
-        return
-    if data in {"grid_run", "grid_stop", "grid_emergency"}:
-        from grid_integration import get_grid_service
-        service, error = get_grid_service()
-        if error:
-            await query.edit_message_text(f"⚠️ {error}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("↩ القائمة", callback_data="menu")]]))
-            return
-        if data == "grid_run":
-            p = service.db.position()
-            if getattr(service, "needs_setup", False):
-                await query.answer("أكمل إعداد العملة والميزانية أولًا", show_alert=True)
-                return
-            if p.get("emergency_stop") or p.get("state") == "FROZEN":
-                await query.answer("لا يمكن التشغيل: Emergency Stop أو FROZEN", show_alert=True)
-                return
-            service.db.update_position(running=1, state="ACTIVE")
-            service.db.event("strategy_started", {"by": tid, "source": "portfolio_bot"})
-            try:
-                await service.tick()
-            except Exception as exc:
-                service.last_error = f"{type(exc).__name__}: {exc}"
-                service.db.update_position(state="FROZEN")
-                await query.answer("فشل التشغيل؛ افتح متابعة المستويات لمعرفة الخطأ", show_alert=True)
-                await query.edit_message_text(
-                    f"⚠️ فشل تشغيل Grid\n\n`{type(exc).__name__}: {exc}`",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 متابعة المستويات", callback_data="grid_levels")]]),
-                )
-                return
-        elif data == "grid_stop":
-            service.db.update_position(running=0, state="PAUSED")
-            service.db.event("strategy_paused", {"by": tid, "source": "portfolio_bot"})
-        else:
-            service.db.update_position(emergency_stop=1, running=0, state="EMERGENCY_STOP")
-            service.db.event("emergency_stop", {"by": tid, "source": "portfolio_bot"})
-        await query.answer("تم تحديث حالة Grid")
-        # Re-render the same screen after the state change.
-        service, _ = get_grid_service()
-        p = service.db.position()
-        await query.edit_message_text(
-            f"▦ *Grid* — `{p.get('state')}`\nالعملة: `{service.cfg.symbol}`\nالمنصرف: `{p.get('spent', '0')}` USDT\nالمتبقي: `{p.get('remaining_budget', '0')}` USDT",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("▶️ تشغيل", callback_data="grid_run"), InlineKeyboardButton("⏸ إيقاف", callback_data="grid_stop")],
-                [InlineKeyboardButton("🛑 طوارئ", callback_data="grid_emergency")],
-                [InlineKeyboardButton("📊 متابعة المستويات", callback_data="grid_levels")],
-                [InlineKeyboardButton("⚙️ إعدادات Grid", callback_data="grid_settings")],
-                [InlineKeyboardButton("🔄 تحديث", callback_data="grid_menu"), InlineKeyboardButton("↩ القائمة", callback_data="menu")],
-            ]),
-        )
-        return
     if data == "menu":
         await query.edit_message_text(
             ui.page_title(ui.I["home"], "لوحة التحكم", "اختار القسم المطلوب من القائمة:") + ui.footer(),
@@ -1690,6 +1449,24 @@ async def _do_rebuild_positions(query, tid, pf_id):
         if not p.coins:
             await query.edit_message_text(
                 "لا توجد عملات في هذه المحفظة.",
+                reply_markup=pf_keyboard(pf_id, True),
+            )
+            return
+
+        symbols = [str(c.symbol).upper() for c in p.coins]
+        shared_allocations = db.query(PortfolioCoin).join(Portfolio).filter(
+            PortfolioCoin.symbol.in_(symbols),
+            PortfolioCoin.portfolio_id != p.id,
+            Portfolio.status == "active",
+            PortfolioCoin.remaining_amount > 0,
+        ).all()
+        if shared_allocations:
+            conflicts = sorted({str(c.symbol).upper() for c in shared_allocations})
+            await query.edit_message_text(
+                "⛔ أُوقفت إعادة البناء قبل إلغاء أي أمر أو تنفيذ تداول، لأن هذه العملات "
+                "مخصصة أيضًا لمحافظ أخرى على حساب MEXC نفسه.\n"
+                f"العملات: {', '.join(conflicts)}\n"
+                "سوِّ المراكز المشتركة أولًا ثم أعد المحاولة.",
                 reply_markup=pf_keyboard(pf_id, True),
             )
             return
@@ -2622,6 +2399,21 @@ async def _do_manual_reentry(query, tid, event_id):
         if not pf or not coin:
             await query.edit_message_text("المحفظة أو العملة غير موجودة.", reply_markup=main_menu_keyboard())
             return
+        other_allocation = db.query(PortfolioCoin).join(Portfolio).filter(
+            PortfolioCoin.symbol == coin.symbol,
+            PortfolioCoin.portfolio_id != pf.id,
+            Portfolio.status == "active",
+            PortfolioCoin.remaining_amount > 0,
+        ).first()
+        if other_allocation:
+            await query.edit_message_text(
+                f"⛔ لم تتم إعادة دخول `{coin.symbol}` لأن العملة مخصصة أيضًا لمحفظة أخرى على حساب MEXC نفسه.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"{ui.I['back']}  المحفظة", callback_data=f"view_{pf.id}")],
+                ]),
+            )
+            return
         user = get_or_create_user(db, tid)
 
         def pct(pf_val, user_val, default):
@@ -2720,6 +2512,24 @@ async def _do_start(query, tid, pf_id, entry_pct=100):
             return
         if p.is_running:
             await query.edit_message_text("المحفظة شغالة مسبقاً.", reply_markup=pf_keyboard(pf_id, True))
+            return
+
+        # MEXC Spot has one shared balance per API account, not per Telegram user
+        # or portfolio. Do not adopt/buy an asset already allocated elsewhere.
+        conflicts = db.query(PortfolioCoin).join(Portfolio).filter(
+            PortfolioCoin.symbol.in_(coins),
+            PortfolioCoin.portfolio_id != p.id,
+            Portfolio.status == "active",
+            PortfolioCoin.remaining_amount > 0,
+        ).all()
+        if conflicts:
+            conflict_symbols = sorted({str(c.symbol).upper() for c in conflicts})
+            await query.edit_message_text(
+                "⛔ لم يتم تشغيل المحفظة لتجنب تخصيص رصيد MEXC نفسه لأكثر من محفظة.\n"
+                f"العملات المتعارضة: {', '.join(conflict_symbols)}\n"
+                "أوقف/سوِّ المراكز الأخرى أولًا، ثم أعد المحاولة.",
+                reply_markup=pf_keyboard(pf_id, False),
+            )
             return
 
         # Check the wallet before buying so restarting a stopped portfolio
@@ -3009,7 +2819,6 @@ async def _do_trim_holdings(query, tid, pf_id, pct):
             other = db.query(PortfolioCoin).join(Portfolio).filter(
                 PortfolioCoin.symbol == symbol,
                 PortfolioCoin.portfolio_id != p.id,
-                Portfolio.telegram_id == tid,
                 Portfolio.status == "active",
                 PortfolioCoin.remaining_amount > 0,
             ).first()
@@ -3310,7 +3119,6 @@ async def _do_restore_trimmed(query, tid, pf_id, pct):
             other = db.query(PortfolioCoin).join(Portfolio).filter(
                 PortfolioCoin.symbol == symbol,
                 PortfolioCoin.portfolio_id != pf.id,
-                Portfolio.telegram_id == tid,
                 Portfolio.status == "active",
                 PortfolioCoin.remaining_amount > 0,
             ).first()
@@ -3476,6 +3284,7 @@ async def _do_stop(query, tid, pf_id):
         sold_total = 0.0
         sold_symbols = []
         fail_symbols = []
+        filled_amounts = {}
 
         # 1) إلغاء أوامر TP + كل أوامر البيع المفتوحة لكل عملة
         def _cancel_phase():
@@ -3509,38 +3318,70 @@ async def _do_stop(query, tid, pf_id):
             other = db.query(PortfolioCoin).join(Portfolio).filter(
                 PortfolioCoin.symbol == c.symbol,
                 PortfolioCoin.portfolio_id != p.id,
-                Portfolio.telegram_id == tid,
                 Portfolio.status == "active",
-                Portfolio.is_running == True,
+                PortfolioCoin.remaining_amount > 0,
             ).first()
             if other:
                 shared.add(c.symbol)
 
         # 2) بيع كل عملة
         def _sell_one(sym, tracked, is_shared):
-            free = float(client.get_free_amount(sym) or 0)
-            total = float(client.get_total_amount(sym) or 0)
-            if is_shared and tracked > 0:
-                amount = min(tracked * 0.998, free if free > 0 else total)
-            else:
-                amount = (free if free > 0 else total) * 0.998
-            if amount <= 0:
-                return {"ok": True, "dust": True, "usdt": 0.0, "amount": 0.0}
+            # Exchange spot balances are shared. Never liquidate an asset allocated
+            # to another portfolio, even if that portfolio is currently paused.
+            if is_shared:
+                return {"ok": False, "error": "الرصيد مشترك مع محفظة أخرى؛ تم تجاوز البيع وحفظ المركز.", "usdt": 0.0, "amount": 0.0}
             try:
-                px = float(client.get_ticker_price(f"{sym}/{client.quote}") or 0)
+                # Do not race a manual/foreign sell order that could still consume
+                # this shared spot balance after our market order is submitted.
+                open_sells = client.fetch_open_sell_orders(sym)
+                if open_sells:
+                    ids = ", ".join(str(o.get("id") or "?") for o in open_sells[:5])
+                    return {"ok": False, "error": f"توجد أوامر بيع مفتوحة ({ids})؛ لم يتم إرسال بيع سوق.", "usdt": 0.0, "amount": 0.0}
+                tracked = max(0.0, float(tracked or 0))
+                free = max(0.0, float(client.get_free_amount(sym) or 0))
+            except Exception as exc:
+                return {"ok": False, "error": f"تعذر تأكيد الرصيد الحر: {exc}", "usdt": 0.0, "amount": 0.0}
+            amount = min(tracked, free)
+            if amount <= 0:
+                return {"ok": False, "error": "لا توجد كمية حرة مؤكدة ضمن كمية المحفظة المسجلة؛ تم الاحتفاظ بسجل المركز.", "usdt": 0.0, "amount": 0.0}
+            try:
                 order = client.create_market_order(f"{sym}/{client.quote}", "sell", amount)
-                if order is None:
-                    return {"ok": True, "dust": True, "usdt": 0.0, "amount": amount}
+                if not order:
+                    return {"ok": False, "error": "لم يتم إنشاء أمر بيع (قد تكون الكمية أقل من الحد الأدنى).", "usdt": 0.0, "amount": 0.0}
+                order_id = order.get("id")
+                checked = order
+                filled = float(checked.get("filled") or 0)
+                for _ in range(3):
+                    if filled > 0 or not order_id:
+                        break
+                    time.sleep(0.4)
+                    fetched = client.fetch_order(str(order_id), f"{sym}/{client.quote}", strict=True)
+                    if fetched:
+                        checked = fetched
+                        filled = float(checked.get("filled") or 0)
+                status = str(checked.get("status") or "").lower()
+                terminal = status in {"closed", "filled", "canceled", "cancelled", "expired", "rejected"}
+                if not order_id or not terminal or filled <= 0:
+                    return {"ok": False, "error": f"حالة الأمر {order_id or 'غير المرقم'} غير محسومة ({status or 'unknown'}); تم الاحتفاظ بسجل المركز دون إعادة البيع.", "usdt": 0.0, "amount": 0.0}
+                filled = min(filled, amount)
+                px = float(checked.get("average") or checked.get("price") or client.get_ticker_price(f"{sym}/{client.quote}") or 0)
+                if px <= 0:
+                    cost = float(checked.get("cost") or 0)
+                    px = cost / filled if cost > 0 else 0
                 return {
                     "ok": True,
                     "dust": False,
-                    "usdt": amount * px,
-                    "amount": amount,
+                    "usdt": filled * px,
+                    "amount": filled,
                     "price": px,
-                    "order_id": order.get("id"),
+                    "order_id": order_id,
+                    "partial": (
+                        filled + max(1e-10, amount * 1e-6) < amount
+                        or free + max(1e-10, tracked * 1e-6) < tracked * 0.99
+                    ),
                 }
             except Exception as e:
-                return {"ok": False, "error": str(e), "usdt": 0.0, "amount": amount}
+                return {"ok": False, "error": str(e), "usdt": 0.0, "amount": 0.0}
 
         for c in coins:
             sym = c.symbol
@@ -3560,6 +3401,7 @@ async def _do_stop(query, tid, pf_id):
             if amt > 0 and usdt > 0:
                 sold_total += usdt
                 sold_symbols.append(sym)
+                filled_amounts[c.id] = amt
                 entry = float(c.entry_price or 0)
                 px = float(res.get("price") or (usdt / amt if amt else 0))
                 pnl = (px - entry) * amt if entry > 0 else 0
@@ -3571,9 +3413,32 @@ async def _do_stop(query, tid, pf_id):
                     )
                 except Exception:
                     logger.exception("record stop trade %s", sym)
+                if res.get("partial"):
+                    fail_symbols.append(f"{sym}: تنفيذ جزئي للأمر {res.get('order_id')}; تم حفظ الكمية المتبقية للمراجعة.")
             await asyncio.sleep(0.25)
 
-        reset_coin_positions(db, pf_id)
+        # Do not erase position history after a failed/unconfirmed/partial sell.
+        if fail_symbols:
+            for coin in coins:
+                filled = float(filled_amounts.get(coin.id, 0.0) or 0.0)
+                if filled <= 0:
+                    continue
+                tracked = max(0.0, float(coin.remaining_amount or coin.amount or 0))
+                remaining = max(0.0, tracked - filled)
+                updates = {
+                    "amount": remaining,
+                    "remaining_amount": remaining,
+                    "position_status": "open" if remaining > 1e-10 else "idle",
+                    "tp_order_id": None, "tp1_order_id": None,
+                    "tp2_order_id": None, "tp3_order_id": None,
+                }
+                try:
+                    update_coin_position(db, coin.id, **updates)
+                except Exception:
+                    logger.exception("could not preserve residual position %s", coin.symbol)
+            db.commit()
+        else:
+            reset_coin_positions(db, pf_id)
         set_portfolio_running(db, pf_id, False)
         log_action(
             db, tid, "stop",
@@ -3710,101 +3575,193 @@ async def _do_remove_coin(query, tid, pf_id, symbol):
         loop = asyncio.get_event_loop()
         notes = []
         cancelled_count = 0
+        reconciled_tracked = None
 
-        # 1) إلغاء أوامر TP المسجّلة + أي أوامر بيع مفتوحة على الزوج
-        def _cancel_all():
-            res = {"cancelled": [], "errors": []}
-            # من القاعدة
-            for key in ("tp_order_id", "tp1_order_id", "tp2_order_id", "tp3_order_id"):
-                oid = getattr(coin, key, None)
-                if not oid:
-                    continue
-                try:
-                    client.cancel_order(str(oid), sym, strict=False)
-                    res["cancelled"].append(str(oid))
-                except Exception as exc:
-                    # أمر منتهي/ملغي مسبقاً — نكمل
-                    logger.warning("cancel %s %s: %s", sym, oid, exc)
-                    res["errors"].append(str(exc))
-            return res
-
+        # Cancel only orders explicitly linked to this portfolio position.
+        # Any other open sell may be manual or belong to another strategy; never cancel it.
+        tracked_order_ids = {
+            str(getattr(coin, key))
+            for key in ("tp_order_id", "tp1_order_id", "tp2_order_id", "tp3_order_id")
+            if getattr(coin, key, None)
+        }
+        def _cancel_tracked():
+            cancelled = []
+            for oid in tracked_order_ids:
+                client.cancel_order(oid, f"{sym}/{client.quote}", strict=True)
+                cancelled.append(oid)
+            return cancelled
         try:
-            cancel_result = await loop.run_in_executor(None, _cancel_all)
-            cancelled_count = len(cancel_result.get("cancelled") or [])
+            cancelled_count = len(await loop.run_in_executor(None, _cancel_tracked))
+            # A remaining order not owned by this position blocks selling. We cannot
+            # prove its ownership, and the exchange's free balance is the only safe guard.
+            open_sells = await loop.run_in_executor(
+                None, lambda: client.fetch_open_sell_orders(sym)
+            )
+            unknown_sells = [o for o in open_sells if str(o.get("id") or "") not in tracked_order_ids]
+            if unknown_sells:
+                ids = ", ".join(str(o.get("id") or "?") for o in unknown_sells[:5])
+                await query.edit_message_text(
+                    f"⚠️ لم يتم حذف `{sym}`: توجد أوامر بيع مفتوحة غير مرتبطة بهذا المركز ({ids}). "
+                    "لن ألغيها أو أبيع الرصيد حتى تراجعها يدويًا.",
+                    parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, p.is_running),
+                )
+                return
+            # Confirm tracked orders are no longer open before selling; reconcile fills.
+            await asyncio.sleep(0.8)
+            open_sells = await loop.run_in_executor(None, lambda: client.fetch_open_sell_orders(sym))
+            if open_sells:
+                await query.edit_message_text(
+                    f"⚠️ لم يتم حذف `{sym}` لأن أوامر البيع لم تُلغَ/تُحسم بعد. احتفظت بسجل المركز.",
+                    parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, p.is_running),
+                )
+                return
+
+            # Cancellation can race with a partial TP fill. Reconcile each tracked
+            # order's terminal status and actual filled quantity before selling the
+            # residual, otherwise the market sell could exceed this position.
+            original_tracked = max(0.0, float(coin.remaining_amount or coin.amount or 0))
+            confirmed_tp_fills = []
+            terminal_statuses = {"closed", "filled", "canceled", "cancelled", "expired", "rejected"}
+            for oid in tracked_order_ids:
+                state = await loop.run_in_executor(
+                    None, lambda order_id=oid: client.fetch_order(
+                        order_id, f"{sym}/{client.quote}", strict=True
+                    )
+                )
+                if not state or str(state.get("status") or "").lower() not in terminal_statuses:
+                    raise RuntimeError(f"تعذر تأكيد الحالة النهائية لأمر TP {oid}")
+                if state.get("filled") is None:
+                    raise RuntimeError(f"المنصة لم تُرجع كمية التنفيذ لأمر TP {oid}")
+                filled_tp = max(0.0, float(state.get("filled") or 0))
+                if filled_tp > 0:
+                    fill_px = float(state.get("average") or state.get("price") or 0)
+                    confirmed_tp_fills.append((oid, filled_tp, fill_px))
+            tp_filled_total = sum(item[1] for item in confirmed_tp_fills)
+            if tp_filled_total > original_tracked + max(1e-10, original_tracked * 1e-6):
+                raise RuntimeError("مجموع تعبئات TP المؤكدة يتجاوز كمية المركز المسجلة")
+            reconciled_tracked = max(0.0, original_tracked - tp_filled_total)
+            for oid, fill_qty, fill_px in confirmed_tp_fills:
+                if fill_px > 0:
+                    entry_px = float(coin.entry_price or 0)
+                    pnl = (fill_px - entry_px) * fill_qty if entry_px > 0 else 0.0
+                    record_trade_event(
+                        db, tid, p.id, coin.id, sym, "tp_reconciled_on_remove",
+                        entry_px, fill_px, fill_qty, pnl,
+                        details=f"TP fill reconciled during coin removal; order={oid}",
+                    )
+            if tp_filled_total > 0:
+                update_coin_position(
+                    db, coin.id, amount=reconciled_tracked,
+                    remaining_amount=reconciled_tracked,
+                    tp_order_id=None, tp1_order_id=None, tp2_order_id=None, tp3_order_id=None,
+                )
         except Exception as exc:
-            logger.exception("remove_coin cancel phase")
-            notes.append(ar_error(exc, "إلغاء الأوامر"))
+            logger.exception("remove_coin cancel/reconcile phase")
+            await query.edit_message_text(
+                f"❌ تعذر تأكيد حالة أوامر `{sym}`: {str(exc)[:160]}\nلم يُبع الرصيد ولم يُحذف السجل.",
+                parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, p.is_running),
+            )
+            return
 
-        # انتظر تحرير الرصيد بعد الإلغاء
-        await asyncio.sleep(1.2)
-
-        # 2) بيع الرصيد الحر (وبعد فشل، جرّب الإجمالي لو اتفك)
-        sold_usdt = 0.0
-        sold_amt = 0.0
-        sell_ok = False
-
-        # هل العملة في محفظة شغّالة تانية؟
+        # Never sell an allocation while another running portfolio tracks the same asset.
         other_running = db.query(PortfolioCoin).join(Portfolio).filter(
             PortfolioCoin.symbol == sym,
             PortfolioCoin.portfolio_id != p.id,
-            Portfolio.telegram_id == tid,
             Portfolio.status == "active",
-            Portfolio.is_running == True,
+            PortfolioCoin.remaining_amount > 0,
         ).first()
+        if other_running:
+            await query.edit_message_text(
+                f"⚠️ لم يتم حذف `{sym}`: العملة مستخدمة في محفظة أخرى تعمل حاليًا. "
+                "أوقف/راجع المحفظة الأخرى أولًا لتجنب بيع تخصيص مشترك.",
+                parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, p.is_running),
+            )
+            return
 
-        tracked = float(coin.remaining_amount or coin.amount or 0)
-
-        def _sell():
-            free = float(client.get_free_amount(sym) or 0)
-            total = float(client.get_total_amount(sym) or 0)
-            # لو في محفظة تانية شغالة: نبيع بس الكمية المتتبعة قدر الإمكان
-            if other_running and tracked > 0:
-                amount = min(tracked * 0.998, free if free > 0 else total)
-            else:
-                amount = free if free > 0 else total
-                amount = amount * 0.998
-            if amount <= 0:
-                return {"sold": 0.0, "amount": 0.0, "dust": True, "error": None}
-            try:
-                px = float(client.get_ticker_price(f"{sym}/{client.quote}") or 0)
-                order = client.create_market_order(
-                    f"{sym}/{client.quote}", "sell", amount
+        tracked = reconciled_tracked if reconciled_tracked is not None else max(
+            0.0, float(coin.remaining_amount or coin.amount or 0)
+        )
+        if tracked <= max(1e-12, float(coin.amount or tracked or 0) * 1e-8):
+            if reconciled_tracked is not None and reconciled_tracked <= max(1e-12, float(coin.amount or 0) * 1e-8):
+                remove_coin_from_portfolio(db, pf_id, sym)
+                await query.edit_message_text(
+                    f"✅ تم حذف `{sym}`: أكدت المنصة أن أوامر TP باعت الكمية المسجلة بالكامل. لم يُرسل أمر بيع إضافي.",
+                    parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, p.is_running),
                 )
-                if order is None:
-                    # dust تحت الحد الأدنى
-                    return {"sold": 0.0, "amount": amount, "dust": True, "error": None}
-                usdt = amount * px
-                return {"sold": usdt, "amount": amount, "dust": False, "error": None, "order_id": order.get("id")}
-            except Exception as e:
-                return {"sold": 0.0, "amount": amount, "dust": False, "error": str(e)}
+                return
+            await query.edit_message_text(
+                f"⚠️ لم يتم حذف `{sym}` لأن الكمية المسجلة صفر. راجع المركز يدويًا.",
+                parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, p.is_running),
+            )
+            return
+
+        # Sell only this position's tracked amount that is confirmed free.
+        def _sell():
+            free = max(0.0, float(client.get_free_amount(sym) or 0))
+            amount = min(tracked, free)
+            if amount <= 0:
+                return {"error": "لا توجد كمية حرة كافية ضمن الكمية المسجلة للمركز."}
+            px = float(client.get_ticker_price(f"{sym}/{client.quote}") or 0)
+            order = client.create_market_order(f"{sym}/{client.quote}", "sell", amount)
+            if not order or not order.get("id"):
+                return {"error": "لم تُرجع المنصة معرّف أمر قابلًا للتحقق؛ لم يُحذف المركز."}
+            order_id = str(order["id"])
+            checked = order
+            # Always query the exchange at least once to reconcile actual fills.
+            for _ in range(5):
+                fetched = client.fetch_order(order_id, f"{sym}/{client.quote}", strict=True)
+                if fetched:
+                    checked = fetched
+                    status = str(checked.get("status") or "").lower()
+                    filled = float(checked.get("filled") or 0)
+                    if status in {"closed", "filled", "canceled", "cancelled", "expired", "rejected"}:
+                        break
+                time.sleep(0.6)
+            filled = min(amount, max(0.0, float(checked.get("filled") or 0)))
+            cost = float(checked.get("cost") or 0)
+            avg = float(checked.get("average") or checked.get("price") or 0)
+            if avg <= 0 and cost > 0 and filled > 0:
+                avg = cost / filled
+            if filled <= 0 or avg <= 0:
+                return {"error": f"تعذر تأكيد كمية/قيمة التنفيذ للأمر {order_id}; احتفظت بسجل المركز."}
+            status = str(checked.get("status") or "").lower()
+            terminal = status in {"closed", "filled", "canceled", "cancelled", "expired", "rejected"}
+            if not terminal:
+                return {"error": f"الأمر {order_id} ما زال غير محسوم ({status or 'unknown'}). لا تعِد البيع؛ راجع الأمر في MEXC مع الاحتفاظ بسجل المركز."}
+            return {"amount": filled, "sold": cost if cost > 0 else filled * avg,
+                    "price": avg, "order_id": order_id, "status": status,
+                    "requested": amount, "terminal": terminal,
+                    "full_fill": terminal and filled + max(1e-10, amount*1e-6) >= amount}
 
         try:
             sell_result = await loop.run_in_executor(None, _sell)
         except Exception as exc:
             logger.exception("remove_coin sell phase")
-            await query.edit_message_text(
-                f"❌ فشل بيع `{sym}`\n{ar_error(exc, 'بيع السوق')}\n"
-                "لم تُحذف من القاعدة — عالج الخطأ ثم أعد المحاولة.",
-                parse_mode="Markdown",
-                reply_markup=pf_keyboard(pf_id, p.is_running),
-            )
-            return
-
+            sell_result = {"error": f"نتيجة الأمر غير مؤكدة: {exc}"}
         if sell_result.get("error"):
-            logger.error("sell %s failed: %s", sym, sell_result["error"])
             await query.edit_message_text(
-                f"❌ فشل بيع `{sym}` بسعر السوق.\n"
-                f"{ar_error(sell_result['error'], 'بيع')}\n"
-                "لم تُحذف من القاعدة.",
-                parse_mode="Markdown",
-                reply_markup=pf_keyboard(pf_id, p.is_running),
+                f"❌ لم يتم حذف `{sym}`. {ar_error(sell_result['error'], 'بيع السوق')}\n"
+                "احتفظت بسجل المركز لتسوية حالة الأمر.",
+                parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, p.is_running),
             )
             return
 
-        sold_usdt = float(sell_result.get("sold") or 0)
         sold_amt = float(sell_result.get("amount") or 0)
-        if sell_result.get("dust") and sold_amt <= 0 and tracked <= 0:
-            notes.append("لا يوجد رصيد للبيع (أو غبار تحت الحد الأدنى)")
+        sold_usdt = float(sell_result.get("sold") or 0)
+        remaining = max(0.0, tracked - sold_amt)
+        if not sell_result.get("full_fill") or remaining > max(1e-10, tracked * 1e-6):
+            update_coin_position(
+                db, coin.id, amount=remaining, remaining_amount=remaining,
+                position_status="open" if remaining > 1e-10 else "idle",
+                tp_order_id=None, tp1_order_id=None, tp2_order_id=None, tp3_order_id=None,
+            )
+            await query.edit_message_text(
+                f"⚠️ تم تنفيذ بيع جزئي مؤكد لـ `{sym}`: `{sold_amt:.8g}`. "
+                f"الكمية المتبقية `{remaining:.8g}` محفوظة في سجل المركز. "
+                f"رقم الأمر: `{sell_result.get('order_id')}`. لم أحذف المركز.",
+                parse_mode="Markdown", reply_markup=pf_keyboard(pf_id, p.is_running),
+            )
+            return
         sell_ok = True
 
         # سجّل حدث البيع إن وُجدت كمية
@@ -3865,19 +3822,37 @@ async def _do_close(query, tid, pf_id):
         if not p:
             await query.edit_message_text("غير موجودة.", reply_markup=main_menu_keyboard())
             return
-        coins = [c.symbol for c in p.coins]
-        if p.is_running and coins:
-            tp_orders = [{
-                "symbol": c.symbol,
-                "tp_order_id": getattr(c, "tp_order_id", None),
-                "tp1_order_id": getattr(c, "tp1_order_id", None),
-                "tp2_order_id": getattr(c, "tp2_order_id", None),
-                "tp3_order_id": getattr(c, "tp3_order_id", None),
-            } for c in p.coins]
-            get_reb().cancel_tp_orders(tp_orders)
-            get_reb().stop_portfolio(coins, dry_run=False)
+        has_tracked_positions = any(
+            max(float(c.remaining_amount or 0), float(c.amount or 0)) > 1e-10
+            for c in p.coins
+        )
+        if p.is_running or has_tracked_positions:
+            # Use the same guarded stop workflow as the normal stop button. The
+            # old direct stop_portfolio call sold the entire free wallet balance
+            # and then erased records even when an order failed or filled partially.
+            await _do_stop(query, tid, pf_id)
+            db.expire_all()
+            p = get_portfolio(db, pf_id, tid)
+            if not p:
+                await query.edit_message_text(
+                    "⚠️ تعذر إعادة تحميل المحفظة بعد الإيقاف؛ لم يتم حذفها.",
+                    reply_markup=main_menu_keyboard(),
+                )
+                return
+            residual = [
+                c for c in p.coins
+                if max(float(c.remaining_amount or 0), float(c.amount or 0)) > 1e-10
+            ]
+            if residual:
+                names = ", ".join(c.symbol for c in residual[:8])
+                await query.edit_message_text(
+                    "⚠️ لم يتم حذف المحفظة لأن بعض المراكز لم تُغلق بأمان. "
+                    f"السجلات محفوظة للمراجعة: {names}. راجع أوامر MEXC ثم أعد المحاولة.",
+                    reply_markup=pf_keyboard(pf_id, False),
+                )
+                return
         close_portfolio(db, pf_id)
-        await query.edit_message_text("✅ تم حذف المحفظة.", reply_markup=main_menu_keyboard())
+        await query.edit_message_text("✅ تم إغلاق المحفظة بعد التأكد من عدم وجود مراكز متبقية.", reply_markup=main_menu_keyboard())
     finally:
         db.close()
 
@@ -4209,23 +4184,36 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 continue
 
             if act["action"] == "tp_full_close":
-                # مزامنة: رصيد المنصة صفر — بدون إشعار مزعج (البيع الحقيقي له إشعار SL/إيقاف)
+                # Spot balance is shared across all portfolios using these API keys.
+                # A zero balance observed by one position must not erase another allocation.
+                other_allocation = db.query(PortfolioCoin).join(Portfolio).filter(
+                    PortfolioCoin.symbol == symbol,
+                    PortfolioCoin.portfolio_id != pf.id,
+                    Portfolio.status == "active",
+                    PortfolioCoin.remaining_amount > 0,
+                ).first()
+                if other_allocation:
+                    logger.warning(
+                        "Preserving %s portfolio=%s: another portfolio still tracks this shared asset",
+                        symbol, pf.id,
+                    )
+                    continue
+                # Only confirmed TP fills are booked as trades; a zero-balance
+                # reconciliation alone does not prove fill quantity or execution price.
                 remaining_before = float(coin.remaining_amount or coin.amount or 0)
                 fill_price = float(act.get("fill_price") or act.get("price") or 0)
                 stage = act.get("stage") or "tp"
-                filled_amount = float(act.get("filled_amount") or remaining_before or 0)
+                filled_raw = act.get("filled_amount")
+                filled_amount = min(remaining_before, max(0.0, float(filled_raw or 0)))
                 record_reconciled_tp_fills(act.get("tp_fills"))
-                if (
-                    not act.get("tp_fills")
-                    and remaining_before > 0
-                    and fill_price
-                    and float(coin.entry_price or 0) > 0
-                ):
-                    pnl = (fill_price - float(coin.entry_price)) * min(filled_amount, remaining_before)
+                # A balance-zero observation is not proof that the tracked quantity
+                # was filled at the current ticker price. Never fabricate a trade/PnL.
+                if act.get("tp_fills") and filled_amount > 0 and fill_price and float(coin.entry_price or 0) > 0:
+                    pnl = (fill_price - float(coin.entry_price)) * filled_amount
                     record_trade_event(
                         db, tid, pf.id, coin.id, symbol, "balance_sync",
-                        coin.entry_price, fill_price, min(filled_amount, remaining_before), pnl,
-                        details=f"مزامنة رصيد صفر ({stage})",
+                        coin.entry_price, fill_price, filled_amount, pnl,
+                        details=f"مزامنة تعبئات TP مؤكدة ({stage})",
                     )
                 update_coin_position(
                     db, coin.id,
@@ -4246,15 +4234,16 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
 
             elif act["action"] == "tp1_hit":
                 remaining_before = float(coin.remaining_amount or coin.amount or 0)
-                filled_amount = float(act.get("filled_amount") or 0)
+                filled_raw = act.get("filled_amount")
+                filled_amount = float(filled_raw) if filled_raw is not None else 0.0
                 if filled_amount <= 0:
-                    filled_amount = remaining_before * 0.40
+                    logger.warning("Ignoring TP1 action without confirmed fill: %s", symbol)
+                    continue
                 filled_amount = min(filled_amount, remaining_before)
-                # لو بعد الخصم مفيش باقي → إغلاق كامل
                 new_rem = max(0.0, remaining_before - filled_amount)
                 fill_price = float(act.get("fill_price") or act.get("price") or coin.tp1_price or 0)
                 pnl = (fill_price - float(coin.entry_price or 0)) * filled_amount
-                if new_rem <= 0 or new_rem < remaining_before * 0.05:
+                if new_rem <= max(1e-12, remaining_before * 1e-8):
                     record_trade_event(
                         db, tid, pf.id, coin.id, symbol, "tp1",
                         coin.entry_price, fill_price, filled_amount, pnl,
@@ -4306,14 +4295,16 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
 
             elif act["action"] == "tp2_hit":
                 remaining_before = float(coin.remaining_amount or coin.amount or 0)
-                filled_amount = float(act.get("filled_amount") or 0)
+                filled_raw = act.get("filled_amount")
+                filled_amount = float(filled_raw) if filled_raw is not None else 0.0
                 if filled_amount <= 0:
-                    filled_amount = remaining_before * 0.50
+                    logger.warning("Ignoring TP2 action without confirmed fill: %s", symbol)
+                    continue
                 filled_amount = min(filled_amount, remaining_before)
                 new_rem = max(0.0, remaining_before - filled_amount)
                 fill_price = float(act.get("fill_price") or act.get("price") or coin.tp2_price or 0)
                 pnl = (fill_price - float(coin.entry_price or 0)) * filled_amount
-                if new_rem <= 0 or new_rem < remaining_before * 0.05:
+                if new_rem <= max(1e-12, remaining_before * 1e-8):
                     record_trade_event(
                         db, tid, pf.id, coin.id, symbol, "tp2",
                         coin.entry_price, fill_price, filled_amount, pnl,
@@ -4369,8 +4360,13 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
 
             elif act["action"] == "tp3_hit":
                 remaining_before = float(coin.remaining_amount or coin.amount or 0)
-                filled_amount = float(act.get("filled_amount") or remaining_before)
+                filled_raw = act.get("filled_amount")
+                filled_amount = float(filled_raw) if filled_raw is not None else 0.0
+                if filled_amount <= 0:
+                    logger.warning("Ignoring TP3 action without confirmed fill: %s", symbol)
+                    continue
                 filled_amount = min(filled_amount, remaining_before)
+                new_rem = max(0.0, remaining_before - filled_amount)
                 fill_price = float(act.get("fill_price") or act.get("price") or coin.tp3_price or 0)
                 pnl = (fill_price - float(coin.entry_price or 0)) * filled_amount
                 record_trade_event(
@@ -4380,16 +4376,17 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 )
                 update_coin_position(
                     db, coin.id,
-                    position_status="closed",
-                    current_sl_price=0.0,
-                    remaining_amount=max(0.0, remaining_before - filled_amount),
-                    amount=max(0.0, remaining_before - filled_amount),
+                    position_status="closed" if new_rem <= max(1e-12, remaining_before * 1e-8) else "tp2_hit",
+                    current_sl_price=float(coin.current_sl_price or 0),
+                    remaining_amount=0.0 if new_rem <= max(1e-12, remaining_before * 1e-8) else new_rem,
+                    amount=0.0 if new_rem <= max(1e-12, remaining_before * 1e-8) else new_rem,
                     tp3_order_id=None,
                 )
-                remove_coin_from_portfolio(db, pf.id, symbol)
+                if new_rem <= max(1e-12, remaining_before * 1e-8):
+                    remove_coin_from_portfolio(db, pf.id, symbol)
                 msg = (
-                    f"🎯 *تحقق الهدف 3 (الأخير)* — `{symbol}`\n"
-                    f"السعر: `{act['price']:.6g}`\n"
+                    f"🎯 *تحقق الهدف 3* — `{symbol}`\n"
+                    f"المنفذ: `{filled_amount:.8g}`، المتبقي: `{new_rem:.8g}`\n"
                     f"المحفظة: *{pf.name if pf else '—'}*"
                 )
                 try:
@@ -4435,6 +4432,27 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     pass
 
             elif act["action"] == "reentry_buy":
+                # Re-entry is another buy against the same shared spot account.
+                other_allocation = db.query(PortfolioCoin).join(Portfolio).filter(
+                    PortfolioCoin.symbol == symbol,
+                    PortfolioCoin.portfolio_id != pf.id,
+                    Portfolio.status == "active",
+                    PortfolioCoin.remaining_amount > 0,
+                ).first()
+                if other_allocation:
+                    logger.warning(
+                        "Skipping automatic re-entry for shared asset %s portfolio=%s",
+                        symbol, pf.id,
+                    )
+                    try:
+                        await context.bot.send_message(
+                            tid,
+                            f"⛔ تم تخطي إعادة دخول `{symbol}` لأن العملة مخصصة لمحفظة أخرى على حساب MEXC نفسه.",
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
+                    continue
                 # buy again with equal share of portfolio investment
                 user = get_or_create_user(db, tid)
                 def _pct(pf_val, user_val, default):
@@ -4694,21 +4712,6 @@ def main():
             "Position monitor job scheduled (every %.1fs)",
             config.STOP_MONITOR_INTERVAL_SECONDS,
         )
-        try:
-            from grid_integration import get_grid_service, grid_monitor_job
-            grid_service, grid_error = get_grid_service()
-            if grid_service is not None:
-                app.job_queue.run_repeating(
-                    grid_monitor_job,
-                    interval=max(5, grid_service.cfg.poll_seconds),
-                    first=10,
-                    job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 30},
-                )
-                logger.info("Grid monitor scheduled (every %ss)", max(5, grid_service.cfg.poll_seconds))
-            elif grid_error:
-                logger.warning("Grid is unavailable; portfolio bot will continue: %s", grid_error)
-        except Exception:
-            logger.exception("Grid integration failed; portfolio bot will continue")
     else:
         logger.warning("JobQueue not available — install python-telegram-bot[job-queue]")
 
