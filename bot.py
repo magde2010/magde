@@ -4535,6 +4535,7 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 filled_amount = float(act.get("filled_amount") or 0)
                 remaining_amount = float(act.get("remaining_amount") or 0)
                 exit_price = float(act.get("price") or 0)
+                sold_value = filled_amount * exit_price
                 entry_price = float(coin.entry_price or 0)
                 if filled_amount > 0:
                     record_trade_event(
@@ -4554,8 +4555,14 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await context.bot.send_message(
                         tid,
-                        f"⚠️ تنفيذ جزئي للاستوب `{symbol}`: تم بيع `{filled_amount:.8g}`، "
-                        f"المتبقي `{remaining_amount:.8g}` — ستتم إعادة المحاولة دون تصفير المركز.",
+                        f"⚠️ *تنفيذ جزئي للاستوب — {symbol}*\n"
+                        f"تم بيع: `{filled_amount:.8g}` وحدة\n"
+                        f"بسعر تقريبي: `{exit_price:.8g}` USDT\n"
+                        f"قيمة البيع: *`{sold_value:.2f}` USDT*\n"
+                        f"المتبقي: `{remaining_amount:.8g}` وحدة\n"
+                        "المعنى: المنصة نفذت جزءًا فقط، لذلك لم يتم تصفير المركز. "
+                        "سيحاول المراقب بيع الكمية المتبقية مرة أخرى.",
+                        parse_mode="Markdown",
                     )
                 except Exception:
                     pass
@@ -4564,6 +4571,7 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                 record_reconciled_tp_fills(act.get("tp_fills"))
                 exit_price = float(act.get("price") or 0)
                 stopped_amount = float(act.get("amount") or 0)
+                sold_value = stopped_amount * exit_price
                 entry_price = float(coin.entry_price or 0)
                 pnl = (exit_price - entry_price) * stopped_amount
                 reentry_available = bool(act.get("reentry_available"))
@@ -4602,7 +4610,9 @@ async def monitor_positions_job(context: ContextTypes.DEFAULT_TYPE):
                     extra = "إعادة الدخول التلقائي مفعّلة."
                 msg = (
                     f"🛡 *ضرب الاستوب{raised}* — `{symbol}`\n"
-                    f"تم البيع فوراً بسعر السوق ≈ `{act['price']:.6g}`\n"
+                    f"تم بيع: `{stopped_amount:.8g}` وحدة\n"
+                    f"بسعر السوق ≈ `{exit_price:.8g}` USDT\n"
+                    f"قيمة البيع: *`{sold_value:.2f}` USDT*\n"
                     f"النتيجة: `{pnl:+.2f}` USDT\n"
                     f"{extra}\n"
                     f"المحفظة: *{pf.name if pf else '—'}*"
