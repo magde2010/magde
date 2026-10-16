@@ -406,7 +406,11 @@ def format_pf(p, current_value: float = None, prices: dict = None, events=None) 
             value = rem * px
             cpnl = value - (rem * entry) if rem > 0 and entry > 0 else 0.0
             coin_lines.append(f"🪙 *{coin.symbol}*: `{value:.2f}` USDT")
-        coins_block = "\n────────────\n".join(coin_lines)
+        coin_rows = [
+            "  │  ".join(coin_lines[index:index + 2])
+            for index in range(0, len(coin_lines), 2)
+        ]
+        coins_block = "\n────────────\n".join(coin_rows)
     else:
         coins_block = "—"
 
