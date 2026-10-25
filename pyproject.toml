@@ -1,0 +1,45 @@
+[project]
+name = "magde-mexc-portfolio-bot"
+version = "1.1.1"
+description = "Telegram bot for managing multiple MEXC Spot portfolios with TP/SL and cloud DCA ladders"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = [".venv", "build", "dist"]
+
+[tool.ruff.lint]
+# بوابة جودة قابلة للتمرير في CI. القواعد الأوسع (BLE001, S110, DTZ003, B023 ...)
+# موثّقة كخط أساس في CHANGELOG ويُنصح بمعالجتها تدريجيًا.
+select = [
+    "E4", "E7", "E9",   # أخطاء pycodestyle الجوهرية
+    "F",                # pyflakes (متغيرات/استيرادات غير مستخدمة)
+    "I",                # ترتيب الاستيرادات
+    "UP",               # تحديث صيغة بايثون الحديثة (PEP 585/604)
+    "ISC",              # دمج النصوص الضمنية
+    "RUF010",           # تحويل f-string صريح
+    "FURB136",          # if-expr → min/max
+    "PLR1730",          # if-stmt → min/max
+]
+ignore = [
+    # مقصود وموثّق في CHANGELOG:
+    "E712",   # مقارنات == True/False داخل فلاتر SQLAlchemy — الشكل المطلوب هناك
+    "F841",   # متغيرات محلية غير مستخدمة (14 موضعًا) — تتطلب مراجعة يدوية
+    "RUF013", # Optional ضمنية في التواقيع (13 موضعًا)
+    "SIM102", "SIM117", # بنيات if/with قابلة للدمج — تجميلية
+]
+
+[tool.ruff.lint.per-file-ignores]
+# استيراد متأخر مقصود: bot.py يفعّل RTL قبل الاستيراد، start.py يتحقق من البيئة
+# قبل الاستيراد، والاختبارات تحاكي ccxt قبل الاستيراد.
+"bot.py" = ["E402"]
+"start.py" = ["E402"]
+"tests/*" = ["E402"]
+# `I` اسم قاموس الأيقونات العام المستخدم في bot.py (واجهة عامة)،
+# وISC004 استمرار نصوص عربية مقصود داخل قاموس المصطلحات.
+"ui_theme.py" = ["E741", "ISC004"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["config", "database", "mexc_client", "order_safety", "portfolio_controls", "portfolio_strategy", "rebalancer", "ui_theme", "ui_bidi"]

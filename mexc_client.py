@@ -1,0 +1,748 @@
+
+import ccxt
+
+import config
+
+
+class MexcClient:
+    def __init__(self):
+        self.exchange = ccxt.mexc({
+            'apiKey': config.MEXC_API_KEY,
+            'secret': config.MEXC_API_SECRET,
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'spot',
+                'recvWindow': 10000,
+            }
+        })
+        self.quote = config.QUOTE_ASSET
+
+    @staticmethod
+    def normalize_asset_symbol(symbol: str) -> str:
+        """Normalize a wallet asset or a configured trading symbol to its base asset."""
+        value = str(symbol or "").strip().upper().replace(" ", "")
+        value = value.lstrip("$")
+        for separator in ("/", ":", "-"):
+            if separator in value:
+                value = value.split(separator, 1)[0]
+                break
+        return value
+
+    @staticmethod
+    def _as_float(value) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def get_balance(self) -> dict:
+        """Return free balances only (non-zero)"""
+        balance = self.exchange.fetch_balance()
+        free = {}
+        for asset, amount in balance.get('free', {}).items():
+            value = self._as_float(amount)
+            if value > 0:
+                key = self.normalize_asset_symbol(asset)
+                free[key] = max(free.get(key, 0.0), value)
+        return free
+
+    def get_total_balance(self) -> dict[str, float]:
+        """Return total balances, including amounts locked in open orders."""
+        balance = self.exchange.fetch_balance()
+        totals = balance.get("total") or {}
+        free = balance.get("free") or {}
+        result = {}
+        for asset in set(totals) | set(free):
+            # Some exchange responses expose a zero/empty total while free
+            # already contains the actual available amount. Use the larger
+            # value so a present wallet asset is not reported as missing.
+            value = max(
+                self._as_float(totals.get(asset)),
+                self._as_float(free.get(asset)),
+            )
+            if value > 0:
+                key = self.normalize_asset_symbol(asset)
+                result[key] = max(result.get(key, 0.0), value)
+        return result
+
+    def get_portfolio_presence(self, symbols: list[str]) -> dict[str, dict[str, float]]:
+        """Return whether each configured coin exists in the wallet.
+
+        Total balance is intentional here: a coin locked in an open sell order
+        is still owned and must not be offered for re-entry.
+
+        A small residual amount can remain after a market sell because the
+        rebalancer keeps a safety buffer for fees and exchange precision.
+        That dust should not make a sold portfolio coin look present.
+        """
+        requested = [str(symbol).upper().strip() for symbol in symbols if symbol]
+        normalized = list(dict.fromkeys(
+            self.normalize_asset_symbol(symbol) for symbol in requested
+        ))
+        balances = self.get_total_balance()
+        prices = self.get_all_prices(normalized)
+        result = {}
+        minimum_value = max(
+            0.0,
+            float(getattr(config, "BALANCE_PRESENCE_MIN_USDT", 1.0)),
+        )
+        for requested_symbol in requested:
+            asset = self.normalize_asset_symbol(requested_symbol)
+            amount = float(balances.get(asset, 0.0))
+            price = float(prices.get(asset, 0.0))
+            market_value = amount * price if price > 0 else 0.0
+            # If the ticker is unavailable, do not classify an asset as
+            # missing just because its value cannot be calculated.
+            present = amount > 0 and (
+                price <= 0 or market_value >= minimum_value
+            )
+            info = {
+                "amount": amount,
+                "price": price,
+                "market_value": market_value,
+                "present": present,
+            }
+            # Keep the requested key for the bot UI, and the normalized alias
+            # for callers that already use base symbols.
+            result[requested_symbol] = info
+            result[asset] = info
+        return result
+
+    def get_free_usdt(self) -> float:
+        bal = self.get_balance()
+        return float(bal.get(self.quote, 0.0))
+
+    def get_ticker_price(self, symbol: str) -> float:
+        """symbol like BTC/USDT"""
+        ticker = self.exchange.fetch_ticker(symbol)
+        return float(ticker['last'])
+
+    def get_ticker_change_pct(self, symbol: str):
+        """Return the exchange-reported 24-hour percentage change, if available."""
+        ticker = self.exchange.fetch_ticker(symbol)
+        value = ticker.get("percentage")
+        return float(value) if value is not None else None
+
+    def get_all_prices(self, symbols: list[str]) -> dict[str, float]:
+        """symbols = ['BTC', 'ETH'] -> prices in USDT.
+        Uses batch fetch_tickers when possible for much higher speed.
+        """
+        prices: dict[str, float] = {self.quote: 1.0}
+        if not symbols:
+            return prices
+
+        unique = list(dict.fromkeys(
+            self.normalize_asset_symbol(s) for s in symbols if s
+        ))
+        pairs = [f"{s}/{self.quote}" for s in unique]
+
+        # Batch request — dramatically faster than sequential fetch_ticker
+        try:
+            tickers = self.exchange.fetch_tickers(pairs)
+            for s, pair in zip(unique, pairs):
+                t = tickers.get(pair) or {}
+                last = t.get("last") or t.get("close")
+                prices[s] = float(last) if last is not None else 0.0
+        except Exception:
+            # Fallback to sequential if batch fails
+            for s in unique:
+                pair = f"{s}/{self.quote}"
+                try:
+                    prices[s] = self.get_ticker_price(pair)
+                except Exception:
+                    prices[s] = 0.0
+        return prices
+
+    def get_all_sell_prices(self, symbols: list[str]) -> dict[str, float]:
+        """Batch best-bid prices for sell-side triggers, falling back to last."""
+        prices: dict[str, float] = {self.quote: 1.0}
+        if not symbols:
+            return prices
+
+        unique = list(dict.fromkeys(
+            self.normalize_asset_symbol(s) for s in symbols if s
+        ))
+        pairs = [f"{s}/{self.quote}" for s in unique]
+        try:
+            tickers = self.exchange.fetch_tickers(pairs)
+            for symbol, pair in zip(unique, pairs):
+                ticker = tickers.get(pair) or {}
+                value = ticker.get("bid")
+                if value is None:
+                    value = ticker.get("last")
+                if value is None:
+                    value = ticker.get("close")
+                prices[symbol] = float(value) if value is not None else 0.0
+        except Exception:
+            for symbol, pair in zip(unique, pairs):
+                try:
+                    ticker = self.exchange.fetch_ticker(pair) or {}
+                    value = ticker.get("bid")
+                    if value is None:
+                        value = ticker.get("last")
+                    if value is None:
+                        value = ticker.get("close")
+                    prices[symbol] = float(value) if value is not None else 0.0
+                except Exception:
+                    prices[symbol] = 0.0
+        return prices
+
+    def get_portfolio_value(self) -> dict:
+        """
+        Returns full account value.
+        {
+            'total_usdt': float,
+            'assets': {
+                'BTC': {'amount': x, 'usdt_value': y, 'percent': z, 'price': p},
+                ...
+            }
+        }
+        """
+        balances = self.get_total_balance()
+        if not balances:
+            return {'total_usdt': 0.0, 'assets': {}}
+
+        assets = [a for a in balances.keys() if a != self.quote]
+        prices = self.get_all_prices(assets)
+
+        total_usdt = 0.0
+        result_assets = {}
+
+        for asset, amount in balances.items():
+            price = prices.get(asset, 0.0) if asset != self.quote else 1.0
+            usdt_value = amount * price
+            total_usdt += usdt_value
+            result_assets[asset] = {
+                'amount': amount,
+                'price': price,
+                'usdt_value': usdt_value,
+                'percent': 0.0
+            }
+
+        if total_usdt > 0:
+            for asset in result_assets:
+                result_assets[asset]['percent'] = (result_assets[asset]['usdt_value'] / total_usdt) * 100
+
+        return {
+            'total_usdt': total_usdt,
+            'assets': result_assets
+        }
+
+    def get_coins_value(self, symbols: list[str]) -> dict:
+        """Value of specific coins only (for a virtual portfolio).
+
+        Uses total balance (free + locked in open orders) so that coins
+        sitting in TP limit-sell orders are still counted correctly.
+        """
+        balances = self.get_total_balance()
+        prices = self.get_all_prices(symbols)
+        total = 0.0
+        details = {}
+        for s in symbols:
+            key = self.normalize_asset_symbol(s)
+            amount = float(balances.get(key, 0.0) or balances.get(s, 0.0))
+            price = float(prices.get(key, 0.0) or prices.get(s, 0.0))
+            usdt_value = amount * price
+            total += usdt_value
+            details[s] = {
+                'amount': amount,
+                'price': price,
+                'usdt_value': usdt_value
+            }
+        return {'total_usdt': total, 'assets': details}
+
+    def create_market_order(self, symbol: str, side: str, amount: float) -> dict | None:
+        """
+        symbol: BTC/USDT
+        side: buy or sell
+        amount: base currency amount
+
+        Returns None (without raising) when the amount is dust / below
+        exchange minimum precision or min notional. This prevents spam
+        when stop-loss tries to sell tiny leftover balances.
+        """
+        try:
+            if not getattr(self.exchange, "markets", None):
+                self.exchange.load_markets()
+            market = self.exchange.market(symbol)
+            limits = market.get("limits") or {}
+            min_amount = float((limits.get("amount") or {}).get("min") or 0)
+            min_cost = float((limits.get("cost") or {}).get("min") or 1.0)
+            if min_cost <= 0:
+                min_cost = 1.0
+
+            # Round down to exchange precision first
+            try:
+                amount = float(self.exchange.amount_to_precision(symbol, amount))
+            except Exception:
+                pass
+
+            if amount <= 0:
+                return None
+            if min_amount > 0 and amount < min_amount:
+                return None  # dust below min amount
+
+            # Check notional value for sells (and buys when possible)
+            try:
+                ticker = self.exchange.fetch_ticker(symbol)
+                price = float(ticker.get("last") or ticker.get("close") or 0)
+            except Exception:
+                price = 0.0
+            if price > 0 and (amount * price) < min_cost:
+                return None  # dust below min notional
+
+            order = self.exchange.create_order(
+                symbol=symbol,
+                type='market',
+                side=side,
+                amount=amount
+            )
+            if not isinstance(order, dict) or not str(order.get("id") or "").strip():
+                raise RuntimeError("Exchange response has no verifiable order ID; submission state may be unknown")
+            return order
+        except Exception as e:
+            err = str(e).lower()
+            # Only narrowly identified exchange minimum/precision rejections count
+            # as dust. Generic filter/network errors must remain visible because
+            # the exchange may have accepted an order before the response failed.
+            dust_markers = (
+                "minimum amount precision",
+                "min amount",
+                "minimum amount",
+                "min notional",
+                "minimum notional",
+                "notional too small",
+                "amount precision",
+                "precision of amount",
+                "amount must be greater than zero",
+                "amount is below the minimum",
+            )
+            if any(marker in err for marker in dust_markers):
+                return None
+            raise Exception(f"Order failed (submission state may be unknown): {e!s}")
+
+    # Markers meaning "this exchange/pair rejects the `cost` parameter".
+    # Any other failure (timeout, network, 5xx) is genuinely unknown: the order
+    # may already be live, so retrying could open a second position.
+    _COST_PARAM_MARKERS = (
+        "unsupported", "not support", "cost parameter", "invalid parameter",
+        "parameter cost", "unknown parameter", "invalid param",
+    )
+
+    def create_market_buy_usdt(self, symbol: str, usdt_amount: float) -> dict | None:
+        """Buy using a quote amount (USDT).
+
+        Tries the cost-based market order first. It only falls back to an
+        amount-based order when the exchange explicitly rejects the `cost`
+        parameter; ambiguous failures are re-raised without a second order.
+        """
+        pair = f"{symbol}/{self.quote}"
+        try:
+            # Prefer cost-based if supported
+            order = self.exchange.create_order(
+                symbol=pair,
+                type='market',
+                side='buy',
+                amount=None,
+                params={'cost': usdt_amount}
+            )
+            return order
+        except Exception as exc:
+            message = str(exc).lower()
+            if not any(marker in message for marker in self._COST_PARAM_MARKERS):
+                raise Exception(f"Market buy failed for {pair}: {exc}")
+            # Explicitly unsupported cost param: retry with a calculated amount.
+            price = self.get_ticker_price(pair)
+            if price <= 0:
+                raise Exception(f"Cannot get price for {pair}")
+            amount = (usdt_amount * 0.998) / price   # small buffer for fees
+            return self.create_market_order(pair, 'buy', amount)
+
+    def get_markets(self) -> list[str]:
+        """Return list of available base assets that have /USDT pair"""
+        markets = self.exchange.load_markets()
+        bases = []
+        for symbol, market in markets.items():
+            if market.get('quote') == self.quote and market.get('active', True) and market.get('spot', True):
+                bases.append(market['base'])
+        return sorted(set(bases))
+
+    def create_limit_buy_usdt(self, symbol: str, usdt_amount: float, price: float) -> dict | None:
+        """Place a limit buy sized by quote budget; used for reserved DCA funds."""
+        pair = f"{symbol}/{self.quote}"
+        try:
+            usdt_amount = float(usdt_amount or 0.0)
+            price = float(price or 0.0)
+            if usdt_amount <= 0 or price <= 0:
+                return None
+            if not getattr(self.exchange, "markets", None):
+                self.exchange.load_markets()
+            market = self.exchange.market(pair)
+            limits = market.get("limits") or {}
+            min_amount = float((limits.get("amount") or {}).get("min") or 0)
+            min_cost = float((limits.get("cost") or {}).get("min") or 1.0)
+            if min_cost <= 0:
+                min_cost = 1.0
+            price = float(self.exchange.price_to_precision(pair, price))
+            amount = float(self.exchange.amount_to_precision(pair, usdt_amount / price))
+            if amount <= 0 or price <= 0:
+                return None
+            if min_amount > 0 and amount < min_amount:
+                return None
+            if amount * price + 1e-9 < min_cost:
+                return None
+            order = self.exchange.create_order(
+                symbol=pair, type="limit", side="buy", amount=amount, price=price
+            )
+            if not isinstance(order, dict) or not str(order.get("id") or "").strip():
+                raise RuntimeError("Exchange response has no verifiable order ID; submission state may be unknown")
+            return order
+        except Exception as exc:
+            message = str(exc).lower()
+            if any(marker in message for marker in (
+                "minimum amount", "min amount", "minimum notional", "min notional",
+                "notional too small", "precision", "amount is below the minimum",
+                "minimum transaction", "too small", "30002",
+            )):
+                return None
+            # Do not automatically retry: a timeout may happen after the exchange
+            # accepted the order, and a second attempt could double the allocation.
+            raise Exception(f"Limit buy failed for {pair}: {exc}")
+
+    def create_limit_sell(self, symbol: str, amount: float, price: float) -> dict | None:
+        """Place a limit sell order (used for Take Profit visible on MEXC).
+
+        Returns None (without raising) when amount/notional is below exchange
+        minimums so tiny dust positions do not spam errors.
+        MEXC typically requires min notional ≈ 1 USDT.
+        """
+        pair = f"{symbol}/{self.quote}"
+        try:
+            # Ensure markets are loaded for precision checks
+            if not getattr(self.exchange, "markets", None):
+                self.exchange.load_markets()
+            market = self.exchange.market(pair)
+            limits = market.get("limits") or {}
+            min_amount = float((limits.get("amount") or {}).get("min") or 0)
+            min_cost = float((limits.get("cost") or {}).get("min") or 1.0)  # MEXC ≈ 1 USDT
+            if min_cost <= 0:
+                min_cost = 1.0
+            precision_amount = market.get("precision", {}).get("amount")
+            # Round down to exchange precision
+            amount = float(self.exchange.amount_to_precision(pair, amount))
+            price = float(self.exchange.price_to_precision(pair, price))
+            if amount <= 0 or price <= 0:
+                return None
+            if min_amount > 0 and amount < min_amount:
+                return None
+            notional = amount * price
+            if notional < min_cost:
+                return None
+            # Some MEXC pairs treat precision as minimum step
+            if precision_amount is not None:
+                try:
+                    step = float(precision_amount)
+                    if 0 < step < 1 and amount < step:
+                        return None
+                except (TypeError, ValueError):
+                    pass
+            order = self.exchange.create_order(
+                symbol=pair,
+                type='limit',
+                side='sell',
+                amount=amount,
+                price=price,
+            )
+            return order
+        except Exception as e:
+            msg = str(e).lower()
+            # Treat precision / minimum amount / min volume errors as skippable
+            if any(x in msg for x in (
+                "minimum amount", "min amount", "precision", "too small",
+                "minimum transaction", "cannot be less", "min notional",
+                "30002",
+            )):
+                return None
+            raise Exception(f"Limit sell failed for {pair}: {e!s}")
+
+    # Exchange messages meaning the order is already gone (cancel is a no-op,
+    # not a failure). Anything else is a real error and must be surfaced.
+    _ORDER_GONE_MARKERS = (
+        "already canceled", "already cancelled", "order not exist",
+        "order does not exist", "order_not_exist", "unknown order", "not found",
+        "30005",
+    )
+
+    def cancel_order(self, order_id: str, symbol: str, strict: bool = False) -> dict | None:
+        """Cancel an open order by id.
+
+        Returns the exchange response on success. When the order is already
+        closed, returns a synthetic `already_gone` result (so callers can treat
+        it as success). Any other error is raised — silently swallowing it hides
+        release failures and can leave tracked positions stranded.
+        """
+        pair = f"{symbol}/{self.quote}" if "/" not in symbol else symbol
+        try:
+            return self.exchange.cancel_order(order_id, pair)
+        except Exception as exc:
+            message = str(exc).lower()
+            if any(marker in message for marker in self._ORDER_GONE_MARKERS):
+                return {"id": order_id, "status": "canceled", "already_gone": True}
+            raise Exception(f"Cancel order {order_id} failed: {exc}")
+
+    def fetch_open_orders(self, symbol: str = None, strict: bool = False) -> list[dict]:
+        """Fetch open orders; strict mode propagates exchange/API failures."""
+        try:
+            if symbol:
+                pair = f"{symbol}/{self.quote}" if "/" not in symbol else symbol
+                return self.exchange.fetch_open_orders(pair)
+            return self.exchange.fetch_open_orders()
+        except Exception:
+            if strict:
+                raise
+            return []
+
+    def fetch_open_sell_orders(self, symbol: str) -> list[dict]:
+        """Fetch only open sell orders for a base asset."""
+        return [
+            order for order in self.fetch_open_orders(symbol, strict=True)
+            if str(order.get("side") or "").lower() == "sell"
+        ]
+
+    def fetch_order(self, order_id: str, symbol: str, strict: bool = False) -> dict | None:
+        """Fetch a single order status.
+
+        With strict=True, propagate API/network errors instead of conflating them
+        with a missing order. Safety-critical sell reconciliation must use strict mode.
+        """
+        pair = f"{symbol}/{self.quote}" if "/" not in symbol else symbol
+        try:
+            return self.exchange.fetch_order(order_id, pair)
+        except Exception:
+            if strict:
+                raise
+            return None
+
+    def get_free_amount(self, symbol: str) -> float:
+        """Free balance of a base asset."""
+        bal = self.get_balance()
+        key = self.normalize_asset_symbol(symbol)
+        return float(bal.get(key, 0.0) or bal.get(symbol, 0.0))
+
+    def get_total_amount(self, symbol: str) -> float:
+        """Total balance (free + locked in open orders) of a base asset."""
+        bal = self.get_total_balance()
+        key = self.normalize_asset_symbol(symbol)
+        return float(bal.get(key, 0.0) or bal.get(symbol, 0.0))
+
+    def cancel_all_open_sells(self, symbol: str) -> dict:
+        """Cancel every open sell order for a symbol on the exchange."""
+        result = {"cancelled": [], "errors": []}
+        try:
+            orders = self.fetch_open_sell_orders(symbol)
+            for order in orders:
+                oid = order.get("id")
+                if not oid:
+                    continue
+                try:
+                    self.cancel_order(str(oid), symbol, strict=False)
+                    result["cancelled"].append(str(oid))
+                except Exception as exc:
+                    result["errors"].append({"order_id": str(oid), "error": str(exc)})
+        except Exception as exc:
+            result["errors"].append({"error": str(exc)})
+        return result
+
+
+    def get_expert_market_context(self, symbols: list[str], timeframe: str = "1h") -> dict:
+        """
+        يبني سياق حي لنظام الخبراء من بيانات MEXC Spot فقط.
+        - OHLCV للحجم والاتجاه والزخم والنطاق
+        - اتجاه وحجم الشموع
+        يرجع dict جاهز لـ ExpertsSystem.decide()
+        """
+        tf_map = {
+            "15m": "15m", "1h": "1h", "4h": "4h",
+            "1d": "1d", "1w": "1w",
+        }
+        tf = tf_map.get(timeframe, "1h")
+
+        # نختار مرجع قوي: BTC إن وُجد، وإلا أول عملة صالحة
+        clean = []
+        for s in (symbols or []):
+            base = self.normalize_asset_symbol(s)
+            if base and base != self.quote and base not in clean:
+                clean.append(base)
+
+        if not clean:
+            clean = ["BTC"]
+
+        # نقرأ حتى 5 عملات كحد أقصى (سرعة + تمثيل المحفظة)
+        to_scan = clean[:5]
+        if "BTC" in clean and "BTC" not in to_scan:
+            to_scan = ["BTC"] + to_scan[:4]
+
+        per_symbol = {}
+        errors = []
+
+        for base in to_scan:
+            pair = f"{base}/{self.quote}"
+            try:
+                ohlcv = self.exchange.fetch_ohlcv(pair, tf, limit=50)
+                if not ohlcv or len(ohlcv) < 15:
+                    errors.append(f"{base}: قليل الشموع")
+                    continue
+
+                closes = [float(c[4]) for c in ohlcv]
+                highs = [float(c[2]) for c in ohlcv]
+                lows = [float(c[3]) for c in ohlcv]
+                volumes = [float(c[5]) for c in ohlcv]
+                last = closes[-1]
+                if last <= 0:
+                    continue
+
+                # حجم
+                avg_vol = sum(volumes[:-1]) / max(len(volumes) - 1, 1)
+                last_vol = volumes[-1]
+                vol_ratio = (last_vol / avg_vol) if avg_vol > 0 else 0.0
+                volume_weak = vol_ratio < 0.75
+                candle_strength = "strong" if vol_ratio >= 1.25 else ("weak" if vol_ratio < 0.85 else "normal")
+
+                # اتجاه (SMA 8 vs SMA 21)
+                sma_fast = sum(closes[-8:]) / 8
+                sma_slow = sum(closes[-21:]) / min(21, len(closes))
+                ratio = sma_fast / sma_slow if sma_slow else 1.0
+                if ratio > 1.008:
+                    trend = "up"
+                elif ratio < 0.992:
+                    trend = "down"
+                else:
+                    trend = "sideways"
+
+                # زخم
+                mom = abs(ratio - 1.0)
+                if mom > 0.02:
+                    momentum = "strong"
+                elif mom > 0.008:
+                    momentum = "cool"
+                else:
+                    momentum = "weak"
+
+                # نطاق / consolidation
+                window = 20
+                hi = max(highs[-window:])
+                lo = min(lows[-window:])
+                range_pct = (hi - lo) / last if last else 0.0
+                consolidation = range_pct < 0.045
+
+                # كسر مؤكد
+                prev_hi = max(highs[-window:-1]) if len(highs) > 1 else hi
+                prev_lo = min(lows[-window:-1]) if len(lows) > 1 else lo
+                breakout_up = last > prev_hi * 1.004
+                breakout_dn = last < prev_lo * 0.996
+                breakout_confirmed = breakout_up or breakout_dn
+
+                # يعتمد السياق على اتجاه وحجم الشموع فقط.
+                flow_bias = "neutral"
+
+                # ATR تقريبي لنسبة المخاطرة
+                trs = []
+                for i in range(1, min(15, len(ohlcv))):
+                    h, lo, pc = highs[-i], lows[-i], closes[-i - 1]
+                    trs.append(max(h - lo, abs(h - pc), abs(lo - pc)))
+                atr = sum(trs) / len(trs) if trs else last * 0.02
+                atr_pct = atr / last if last else 0.02
+                # نعتبر RR مقبول لو ATR مش متفجر (سوق قابل لإدارة الاستوب)
+                rr_ok = 0.005 < atr_pct < 0.08
+
+                per_symbol[base] = {
+                    "volume_weak": volume_weak,
+                    "candle_strength": candle_strength,
+                    "flow_bias": flow_bias,
+                    "trend": trend,
+                    "momentum": momentum,
+                    "consolidation": consolidation,
+                    "breakout_confirmed": breakout_confirmed,
+                    "rr_ok": rr_ok,
+                    "range_pct": round(range_pct * 100, 2),
+                    "vol_ratio": round(vol_ratio, 2),
+                    "last": last,
+                }
+            except Exception as e:
+                errors.append(f"{base}: {e}")
+
+        if not per_symbol:
+            # fallback محافظ — يمنع أي دخول عشوائي
+            return {
+                "netflow": "neutral",
+                "volume_weak": True,
+                "candle_strength": "weak",
+                "flow_bias": "neutral",
+                "trend": "sideways",
+                "momentum": "cool",
+                "regime": "consolidation",
+                "mood": "neutral",
+                "macro": "neutral",
+                "consolidation": True,
+                "breakout_confirmed": False,
+                "rr_ok": False,
+                "data_source": "fallback (فشل قراءة MEXC)",
+                "symbols_used": ", ".join(to_scan),
+                "errors": errors[:5],
+            }
+
+        # تجميع الأغلبية عبر العملات المقروءة
+        def majority(key, default):
+            vals = [d[key] for d in per_symbol.values() if key in d]
+            if not vals:
+                return default
+            from collections import Counter
+            return Counter(vals).most_common(1)[0][0]
+
+        volume_weak = majority("volume_weak", True)
+        # لو أي عملة حجمها قوي نخفف الفيتو قليلاً
+        if any(not d.get("volume_weak", True) for d in per_symbol.values()):
+            # أغلبية ضعيفة فقط لو أكثر من نصفها ضعيف
+            weak_count = sum(1 for d in per_symbol.values() if d.get("volume_weak", True))
+            volume_weak = weak_count > len(per_symbol) / 2
+
+        trend = majority("trend", "sideways")
+        momentum = majority("momentum", "cool")
+        consolidation = majority("consolidation", True)
+        breakout = any(d.get("breakout_confirmed") for d in per_symbol.values())
+        rr_ok = majority("rr_ok", False)
+        orderflow = majority("flow_bias", "neutral")
+        candle = majority("candle_strength", "weak")
+
+        if trend == "up":
+            regime = "uptrend"
+        elif trend == "down":
+            regime = "downtrend"
+        else:
+            regime = "consolidation"
+
+        used = ", ".join(per_symbol.keys())
+        detail = " | ".join(
+            f"{k}:T={v['trend']}/V={v['vol_ratio']}/R={v['range_pct']}%"
+            for k, v in list(per_symbol.items())[:3]
+        )
+
+        return {
+            "netflow": "neutral",
+            "volume_weak": volume_weak,
+            "candle_strength": candle,
+            "flow_bias": orderflow,
+            "trend": trend,
+            "momentum": momentum,
+            "regime": regime,
+            "mood": "neutral",
+            "macro": "neutral",
+            "consolidation": consolidation,
+            "breakout_confirmed": breakout,
+            "rr_ok": rr_ok,
+            "data_source": f"MEXC Spot OHLCV+OB ({tf})",
+            "symbols_used": used,
+            "detail": detail,
+            "errors": errors[:3] if errors else [],
+            "per_symbol": {k: {kk: vv for kk, vv in v.items() if kk != "last"} for k, v in per_symbol.items()},
+        }
