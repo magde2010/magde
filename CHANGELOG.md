@@ -1,11 +1,44 @@
 # سجل التغييرات — Changelog
 
+## [1.1.2] — 2026-10-29
+
+### إصلاح (البناء)
+- **إصلاح فشل CI في خطوة Lint**: الخطوة كانت تفشل بثلاثة أخطاء فقط أوقفت `compileall` والاختبارات بعدها:
+  - `bot.py:4256` — `UP041`: استخدام `except asyncio.TimeoutError` → `except TimeoutError` (اسمان لنفس الاستثناء في Python 3.11+).
+  - `database.py:644` و`database.py:800` — `F402`: متغير الحلقة `event` كان يحجب `from sqlalchemy import event` (دالة SQLAlchemy المستخدمة في `@event.listens_for`)؛ أُعيد تسميته إلى `ev`.
+- **السبب الجذري**: كان الـ CI يثبّت `ruff` بأحدث إصدار (`pip install ruff`)، فأي قاعدة جديدة تكسر الفرع الرئيسي بدون أي تغيير في الكود. أُضيف **`requirements-dev.txt`** بإصدارات مثبّتة (`pytest==9.0.3`, `ruff==0.17.3`) ويستخدمه الـ workflow الآن.
+
+### إصلاح (التوثيق)
+- **README.md** صُحح بالكامل ليطابق الكود فعليًا:
+  - حُذف متغيرا البيئة غير الموجودين في الكود (`BTC_PORTFOLIO_ACTION_COOLDOWN_SEC` و`OWNERSHIP_TOLERANCE_PCT/_AMOUNT/_USDT`) — القيم المقابلة لهما ثوابت داخل `rebalancer.py` و`portfolio_strategy.py`، وذُكر ذلك صراحةً.
+  - أُضيف المتغير الحقيقي المفقود `UI_BIDI_FIX` (يُقرأ في `ui_bidi.py`).
+  - تصحيح افتراضي `STOP_MONITOR_INTERVAL_SECONDS` من 5 إلى **15** (مطابق لـ `config.py`).
+  - إعادة كتابة وصف DCA: نسبة دخول أولي **10%–90%** و**1–3 مستويات** لكل مستوى وزن ونسبة هبوط مستقلان (50%/3% — 30%/6% — 20%/10%)، بدل الوصف القديم «50/50 أو 70/30 ومستويات متساوية حتى وقف الخسارة».
+  - إزالة ادعاء «تسامحات قابلة للضبط» في فحص الملكية، واستبداله بسلوك الكود الفعلي.
+  - تصحيح عدد الاختبارات من 56 إلى **76** في كل المواضع (نسخة إنجليزية أيضًا).
+  - استكمال شجرة المشروع (9 ملفات ناقصة: `compact_plan.py`, `trading_guard.py`, `conftest.py`, `requirements-dev.txt`, `railway.toml`, `Procfile`, `CHANGELOG.md`, `.env.example`, `.editorconfig`) وجدول المستندات (`HOSTLESS_DEPLOYMENT_AR.md`, `LOCAL_FIX_REVIEW_AR.md`) وذُكر Hostless في القسم العربي كذلك.
+  - قسم جديد: **المتطلبات**، **مشاكل شائعة**، أوامر ويندوز، وطريقة الحصول على `ADMIN_TELEGRAM_ID`، وتحذير SQLite للنشر.
+- **`.env.example`**: حُذفت المتغيرات غير المستخدمة، وأُضيف `UI_BIDI_FIX`، وتوضيح أن `ADMIN_TELEGRAM_ID` رقم من @userinfobot، وأن الحد الأدنى للأمر وتهدئة إعادة الدخول ثوابت لا متغيرات.
+- **`.github/workflows/tests.yml`**: تثبيت أدوات الفحص من `requirements-dev.txt`، وإضافة `permissions: contents: read`، واستثناء `.venv`/`.git` من `compileall`.
+
+### تغييرات
+- توحيد إصدار بايثون على **3.12+**: `requires-python = ">=3.12"` في `pyproject.toml` (كان `>=3.10`) ليطابق بادج الـ README وإصدار الـ CI و`target-version = "py312"`.
+- `pyproject.toml`: الإصدار `1.1.1` → `1.1.2`.
+- `docs/LOCAL_FIX_REVIEW_AR.md`: وُسم المرجع القديم بـ commit غير موجود في تاريخ المستودع (`b85383d`) كمرجع تاريخي بدل الإيحاء بأنه الحالة الراهنة.
+
+### تحقق
+- `ruff check .` → **All checks passed**
+- `python -m compileall -q .` → نظيف
+- `python -m pytest -q` → **76 passed**
+
+> لم تُعدَّل أي قاعدة تداول أو حساب أحجام أو أمر منصة في هذا الإصدار؛ التغييرات محصورة في التوثيق وأدوات البناء وإعادة تسمية متغير محلي.
+
 ## [1.1.1] — 2026-10-20
 
 ### إصلاح
 - **إصلاح عطل إقلاع النشر (Railway)**: SQLAlchemy 2.1 يختار مشغّل `postgresql+psycopg` (psycopg v3) افتراضيًا لروابط `postgresql://`، وكانت الحاوية تفتقد حزمة `psycopg` فانهار الاستيراد بـ `ModuleNotFoundError: No module named 'psycopg'`.
 - أُضيف `psycopg[binary]==3.3.6` إلى `requirements.txt` (مع بقاء `psycopg2-binary` للتوافق مع البيئات الأقدم).
-- التحقق: تثبيت نظيف في venv جديد من `requirements.txt`، ثم استيراد `database` مع رابط `postgresql://` يُنشئ محرك SQLAlchemy بمشغّل psycopg بنجاح، مع نجاح 56/56 اختبارًا وcompileall.
+- التحقق: تثبيت نظيف في venv جديد من `requirements.txt`، ثم استيراد `database` مع رابط `postgresql://` يُنشئ محرك SQLAlchemy بمشغّل psycopg بنجاح، مع نجاح 56/56 اختبارًا وcompileall (كان هذا عدد الاختبارات في ذلك الإصدار؛ العدد الحالي 76).
 
 ## [1.1.0] — 2026-10-20
 

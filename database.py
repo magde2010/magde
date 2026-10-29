@@ -641,12 +641,12 @@ def invalidate_reentry_events(db, portfolio_id: int, symbol: str = None, reason:
     if symbol:
         q = q.filter(PortfolioTrade.symbol == symbol.upper())
     events = q.all()
-    for event in events:
-        event.reentry_available = False
-        event.reentry_used = True
+    for ev in events:
+        ev.reentry_available = False
+        ev.reentry_used = True
         if reason:
             suffix = f" | {reason}"
-            event.details = ((event.details or "") + suffix)[:500]
+            ev.details = ((ev.details or "") + suffix)[:500]
     return len(events)
 
 
@@ -797,9 +797,9 @@ def mark_reentry_events_used(db, portfolio_id: int, symbol: str):
         PortfolioTrade.reentry_available == True,
         PortfolioTrade.reentry_used == False,
     ).all()
-    for event in events:
-        event.reentry_available = False
-        event.reentry_used = True
+    for ev in events:
+        ev.reentry_available = False
+        ev.reentry_used = True
     db.commit()
     return len(events)
 

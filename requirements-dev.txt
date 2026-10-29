@@ -1,0 +1,5 @@
+# أدوات التطوير والفحص — لا تُستخدم في الإنتاج
+# Dev/lint/test tooling only. Pinned so CI cannot break on a new upstream release.
+-r requirements.txt
+pytest==9.0.3
+ruff==0.17.3

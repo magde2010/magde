@@ -5,6 +5,9 @@ on:
     branches: [main, master]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -19,13 +22,15 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest ruff
+          # Dev tools are pinned in requirements-dev.txt: an unpinned linter
+          # silently turns `main` red whenever a new ruff rule ships.
+          pip install -r requirements-dev.txt
 
       - name: Lint (ruff quality gate)
         run: ruff check .
 
       - name: Byte-compile all modules
-        run: python -m compileall -q .
+        run: python -m compileall -q -x '(\.git|\.venv)' .
 
       - name: Run unit tests
         run: python -m pytest -q

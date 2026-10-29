@@ -4253,7 +4253,7 @@ async def _do_start(query, tid, pf_id, entry_pct=100):
                 ),
                 timeout=90,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:  # asyncio.TimeoutError alias (Python 3.11+)
             await query.edit_message_text(
                 "⚠️ انتهت مهلة قراءة أرصدة وأسعار MEXC بعد 90 ثانية.\n"
                 "لم تُرسل أوامر TP/SL ولم تُشغّل المحفظة. تحقق من اتصال MEXC ثم أعد المحاولة.",
