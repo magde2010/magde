@@ -18,3 +18,14 @@ def test_optional_env_float_applies_the_safe_minimum(monkeypatch):
 
     monkeypatch.setenv("MAGDE_TEST_OPTIONAL_FLOAT", "7.5")
     assert config.optional_env_float("MAGDE_TEST_OPTIONAL_FLOAT", 5.0, 1.0) == 7.5
+
+
+def test_env_value_removes_deployment_copy_paste_wrappers(monkeypatch):
+    monkeypatch.setenv("MAGDE_TEST_SECRET", '  "key-value"  ')
+    assert config.env_value("MAGDE_TEST_SECRET") == "key-value"
+
+    monkeypatch.setenv("MAGDE_TEST_SECRET", "   'secret-value'   ")
+    assert config.env_value("MAGDE_TEST_SECRET") == "secret-value"
+
+    monkeypatch.setenv("MAGDE_TEST_SECRET", "   ")
+    assert config.env_value("MAGDE_TEST_SECRET") is None
