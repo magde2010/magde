@@ -44,6 +44,7 @@ from database import (
     get_portfolio_trade_events,
     get_portfolios,
     get_trade_event,
+    has_running_symbol_conflict,
     init_db,
     log_action,
     mark_reentry_events_used,
@@ -2825,14 +2826,8 @@ async def _do_rebuild_positions(query, tid, pf_id, entry_strategy=None, dca_buy_
             return
 
         symbols = [str(c.symbol).upper() for c in p.coins]
-        shared_allocations = db.query(PortfolioCoin).join(Portfolio).filter(
-            PortfolioCoin.symbol.in_(symbols),
-            PortfolioCoin.portfolio_id != p.id,
-            Portfolio.status == "active",
-            PortfolioCoin.remaining_amount > 0,
-        ).all()
-        if shared_allocations:
-            conflicts = sorted({str(c.symbol).upper() for c in shared_allocations})
+        conflicts = has_running_symbol_conflict(db, tid, p.id, symbols)
+        if conflicts:
             await query.edit_message_text(
                 "⛔ أُوقفت إعادة البناء قبل إلغاء أي أمر أو تنفيذ تداول، لأن هذه العملات "
                 "مخصصة أيضًا لمحافظ أخرى على حساب MEXC نفسه.\n"
@@ -4076,17 +4071,11 @@ async def _do_start(query, tid, pf_id, entry_pct=100):
 
         # MEXC Spot has one shared balance per API account, not per Telegram user
         # or portfolio. Do not adopt/buy an asset already allocated elsewhere.
-        conflicts = db.query(PortfolioCoin).join(Portfolio).filter(
-            PortfolioCoin.symbol.in_(coins),
-            PortfolioCoin.portfolio_id != p.id,
-            Portfolio.status == "active",
-            PortfolioCoin.remaining_amount > 0,
-        ).all()
+        conflicts = has_running_symbol_conflict(db, tid, p.id, coins)
         if conflicts:
-            conflict_symbols = sorted({str(c.symbol).upper() for c in conflicts})
             await query.edit_message_text(
                 "⛔ لم يتم تشغيل المحفظة لتجنب تخصيص رصيد MEXC نفسه لأكثر من محفظة.\n"
-                f"العملات المتعارضة: {', '.join(conflict_symbols)}\n"
+                f"العملات المتعارضة: {', '.join(conflicts)}\n"
                 "أوقف/سوِّ المراكز الأخرى أولًا، ثم أعد المحاولة.",
                 reply_markup=pf_keyboard(pf_id, False),
             )
